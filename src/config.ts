@@ -14,6 +14,7 @@ export interface AppConfig {
   authToken?: string;
   requireConfirmation: boolean;
   maxMessageHistory: number;
+  mockMode: boolean;
 }
 
 function parseAllowedGuilds(raw?: string, defaultGuild?: string): string[] {
@@ -45,6 +46,9 @@ export function loadConfig(): AppConfig {
   const requireConfirmation = process.env.REQUIRE_CONFIRMATION !== 'false';
   const maxMessageHistory = Math.min(Math.max(parseInt(process.env.MAX_MESSAGE_HISTORY || '100', 10), 1), 100);
 
+  // Mock / Test mode (enabled via --mock, MOCK_MODE=true, or automatically when DISCORD_BOT_TOKEN is not set)
+  const mockMode = process.argv.includes('--mock') || process.env.MOCK_MODE === 'true' || !discordToken;
+
   return {
     discordToken,
     defaultGuildId,
@@ -54,7 +58,8 @@ export function loadConfig(): AppConfig {
     host,
     authToken,
     requireConfirmation,
-    maxMessageHistory
+    maxMessageHistory,
+    mockMode
   };
 }
 
