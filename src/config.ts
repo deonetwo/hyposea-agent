@@ -15,6 +15,8 @@ export interface AppConfig {
   requireConfirmation: boolean;
   maxMessageHistory: number;
   mockMode: boolean;
+  clientId: string;
+  clientSecret: string;
 }
 
 function parseAllowedGuilds(raw?: string, defaultGuild?: string): string[] {
@@ -49,6 +51,9 @@ export function loadConfig(): AppConfig {
   // Mock / Test mode (enabled via --mock, MOCK_MODE=true, or automatically when DISCORD_BOT_TOKEN is not set)
   const mockMode = process.argv.includes('--mock') || process.env.MOCK_MODE === 'true' || !discordToken;
 
+  const clientId = process.env.MCP_CLIENT_ID || 'moon-link-gemini';
+  const clientSecret = process.env.MCP_CLIENT_SECRET || 'moon-link-secret-2026';
+
   return {
     discordToken,
     defaultGuildId,
@@ -59,7 +64,9 @@ export function loadConfig(): AppConfig {
     authToken,
     requireConfirmation,
     maxMessageHistory,
-    mockMode
+    mockMode,
+    clientId,
+    clientSecret
   };
 }
 
