@@ -1,22 +1,20 @@
+import crypto from 'node:crypto';
 import dotenv from 'dotenv';
-import path from 'path';
 
-// Load .env file from current working directory or moon-link root
+// Load environment variables from .env file
 dotenv.config();
 
 export interface AppConfig {
   discordToken: string;
   defaultGuildId?: string;
   allowedGuildIds: string[];
-  transport: 'stdio' | 'sse';
   port: number;
   host: string;
-  authToken?: string;
+  authToken: string;
   requireConfirmation: boolean;
   maxMessageHistory: number;
-  mockMode: boolean;
-  clientId: string;
-  clientSecret: string;
+  mockMode?: boolean;
+  transport?: string;
 }
 
 function parseAllowedGuilds(raw?: string, defaultGuild?: string): string[] {
@@ -31,47 +29,52 @@ function parseAllowedGuilds(raw?: string, defaultGuild?: string): string[] {
 }
 
 export function loadConfig(): AppConfig {
-  const discordToken = process.env.DISCORD_BOT_TOKEN || '';
-  const defaultGuildId = process.env.DISCORD_GUILD_ID || undefined;
+  const discordToken = process.env.DISCORD_BOT_TOKEN?.trim() || '';
+  const authToken = process.env.MCP_AUTH_TOKEN?.trim() || '';
+  const defaultGuildId = process.env.DISCORD_GUILD_ID?.trim() || undefined;
   const allowedGuildIds = parseAllowedGuilds(process.env.ALLOWED_GUILD_IDS, defaultGuildId);
-
-  // Transport configuration
-  const transportArg = process.argv.includes('--sse') ? 'sse' : (process.argv.includes('--stdio') ? 'stdio' : null);
-  const transportEnv = (process.env.MCP_TRANSPORT || '').toLowerCase() === 'sse' ? 'sse' : 'stdio';
-  const transport = (transportArg || transportEnv) as 'stdio' | 'sse';
 
   const port = parseInt(process.env.MCP_PORT || '3000', 10);
   const host = process.env.MCP_HOST || '0.0.0.0';
-  const authToken = process.env.MCP_AUTH_TOKEN || undefined;
 
-  // Security guardrails
   const requireConfirmation = process.env.REQUIRE_CONFIRMATION !== 'false';
   const maxMessageHistory = Math.min(Math.max(parseInt(process.env.MAX_MESSAGE_HISTORY || '100', 10), 1), 100);
-
-  // Mock / Test mode (enabled via --mock, MOCK_MODE=true, or automatically when DISCORD_BOT_TOKEN is not set)
-  const mockMode = process.argv.includes('--mock') || process.env.MOCK_MODE === 'true' || !discordToken;
-
-  const clientId = process.env.MCP_CLIENT_ID || 'moon-link-gemini';
-  const clientSecret = process.env.MCP_CLIENT_SECRET || 'moon-link-secret-2026';
 
   return {
     discordToken,
     defaultGuildId,
     allowedGuildIds,
-    transport,
     port,
     host,
     authToken,
     requireConfirmation,
     maxMessageHistory,
-    mockMode,
-    clientId,
-    clientSecret
+    mockMode: process.argv.includes('--mock') || process.env.MOCK_MODE === 'true',
+    transport: 'sse'
   };
 }
 
-export function maskToken(token?: string): string {
-  if (!token) return '(not set)';
-  if (token.length <= 8) return '****';
-  return `${token.substring(0, 4)}...${token.substring(token.length - 4)}`;
+export function maskSecret(secret?: string): string {
+  if (!secret) return '(not set)';
+  if (secret.length <= 8) return '****';
+  return `${secret.substring(0, 4)}...${secret.substring(secret.length - 4)}`;
+}
+
+/**
+ * Constant-time comparison between a user-supplied token and the configured secret.
+ * Mitigates timing side-channel attacks.
+ */
+export function timingSafeCompare(suppliedToken?: string, expectedSecret?: string): boolean {
+  if (!suppliedToken || !expectedSecret) return false;
+  
+  const suppliedBuffer = Buffer.from(suppliedToken);
+  const expectedBuffer = Buffer.from(expectedSecret);
+
+  if (suppliedBuffer.length !== expectedBuffer.length) {
+    // Constant-time execution even when lengths differ
+    crypto.timingSafeEqual(expectedBuffer, expectedBuffer);
+    return false;
+  }
+
+  return crypto.timingSafeEqual(suppliedBuffer, expectedBuffer);
 }
