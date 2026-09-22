@@ -15,6 +15,11 @@ export interface AppConfig {
   maxMessageHistory: number;
   mockMode?: boolean;
   transport?: string;
+  mainframeEnabled?: boolean;
+  mainframeChannel?: string;
+  mainframeAuthorizedUsers?: string[];
+  mainframePrefix?: string;
+  agyBinPath?: string;
 }
 
 function parseAllowedGuilds(raw?: string, defaultGuild?: string): string[] {
@@ -40,6 +45,13 @@ export function loadConfig(): AppConfig {
   const requireConfirmation = process.env.REQUIRE_CONFIRMATION !== 'false';
   const maxMessageHistory = Math.min(Math.max(parseInt(process.env.MAX_MESSAGE_HISTORY || '100', 10), 1), 100);
 
+  const mainframeChannel = process.env.MAINFRAME_CHANNEL?.trim() || 'mainframe-channel';
+  const mainframePrefix = process.env.MAINFRAME_PREFIX?.trim() || '!agy';
+  const agyBinPath = process.env.AGY_BIN_PATH?.trim() || '/home/ubuntu/.local/bin/agy';
+  const mainframeEnabled = process.env.MAINFRAME_ENABLED !== 'false';
+  const rawUsers = process.env.MAINFRAME_AUTHORIZED_USERS || '515099684893622277';
+  const mainframeAuthorizedUsers = rawUsers.split(',').map(s => s.trim()).filter(Boolean);
+
   return {
     discordToken,
     defaultGuildId,
@@ -50,7 +62,12 @@ export function loadConfig(): AppConfig {
     requireConfirmation,
     maxMessageHistory,
     mockMode: process.argv.includes('--mock') || process.env.MOCK_MODE === 'true',
-    transport: 'sse'
+    transport: 'sse',
+    mainframeEnabled,
+    mainframeChannel,
+    mainframeAuthorizedUsers,
+    mainframePrefix,
+    agyBinPath
   };
 }
 
