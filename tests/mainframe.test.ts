@@ -1,5 +1,11 @@
 import assert from 'node:assert';
-import { convertMarkdownTablesToBullets, formatForDiscord, splitDiscordMessage } from '../src/mainframe.js';
+import {
+  convertMarkdownTablesToBullets,
+  formatForDiscord,
+  hasExplicitConfirmationFlag,
+  isDeletionIntent,
+  splitDiscordMessage
+} from '../src/mainframe.js';
 
 function runMainframeUnitTests() {
   console.log('\n--- Running Mainframe Unit Tests ---\n');
@@ -75,8 +81,29 @@ function runMainframeUnitTests() {
   assert.ok(formatted.includes('@\u200bhere'), '@here should be zero-width escaped');
   console.log('✅ Headers demoted and mass mentions escaped.');
 
+  // Test 8: Deletion intent detection
+  console.log('\nTest 8: Deletion intent detection');
+  assert.strictEqual(isDeletionIntent('delete the temp file'), true);
+  assert.strictEqual(isDeletionIntent('rm -rf node_modules'), true);
+  assert.strictEqual(isDeletionIntent('remove old channel'), true);
+  assert.strictEqual(isDeletionIntent('drop database test'), true);
+  assert.strictEqual(isDeletionIntent('purge messages from yesterday'), true);
+  assert.strictEqual(isDeletionIntent('wipe test artifacts'), true);
+  assert.strictEqual(isDeletionIntent('show current git status'), false);
+  assert.strictEqual(isDeletionIntent('create a new file called app.ts'), false);
+  console.log('✅ Accurately detected deletion/destructive prompts.');
+
+  // Test 9: Explicit confirmation flags
+  console.log('\nTest 9: Explicit confirmation flag detection');
+  assert.strictEqual(hasExplicitConfirmationFlag('rm test.txt --force'), true);
+  assert.strictEqual(hasExplicitConfirmationFlag('delete logs -f'), true);
+  assert.strictEqual(hasExplicitConfirmationFlag('rm -rf build --yes'), true);
+  assert.strictEqual(hasExplicitConfirmationFlag('drop table -y'), true);
+  assert.strictEqual(hasExplicitConfirmationFlag('delete file.txt'), false);
+  console.log('✅ Accurately detected explicit bypass flags.');
+
   console.log('\n=====================================================');
-  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (7/7)');
+  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (9/9)');
   console.log('=====================================================\n');
 }
 

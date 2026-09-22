@@ -1,5 +1,13 @@
 import { execFile } from 'node:child_process';
-import { Client, Message, TextBasedChannel } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  ComponentType,
+  Message,
+  TextBasedChannel
+} from 'discord.js';
 import { AppConfig } from './config.js';
 
 interface AgyRunResult {
@@ -180,6 +188,21 @@ export function formatForDiscord(raw: string): string {
 }
 
 /**
+ * Detects whether a prompt expresses a deletion or destructive intent
+ */
+export function isDeletionIntent(prompt: string): boolean {
+  const DELETION_REGEX = /\b(delete|del|rm|remove|drop|truncate|purge|destroy|unlink|wipe|erase)\b/i;
+  return DELETION_REGEX.test(prompt);
+}
+
+/**
+ * Checks if the user provided an explicit force or confirmation flag
+ */
+export function hasExplicitConfirmationFlag(prompt: string): boolean {
+  return /(--force|-f|--confirm|--yes|-y)\b/i.test(prompt);
+}
+
+/**
  * Executes a prompt against the AGY CLI non-interactively in json mode
  */
 export async function runAgyCommand(
@@ -353,7 +376,63 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       return;
     }
 
-    // 7. Execute AGY Prompt
+    // 7. Check for Deletion / Destructive Intent & Require Confirmation
+    if (isDeletionIntent(prompt) && !hasExplicitConfirmationFlag(prompt)) {
+      const confirmButton = new ButtonBuilder()
+        .setCustomId('confirm_deletion')
+        .setLabel('Confirm Deletion')
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji('🗑️');
+
+      const cancelButton = new ButtonBuilder()
+        .setCustomId('cancel_deletion')
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji('✖️');
+
+      const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmButton, cancelButton);
+
+      const promptPreview = prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt;
+      const confirmMsg = await message.reply({
+        content:
+          `⚠️ **Deletion Confirmation Required**\n` +
+          `Your prompt contains a deletion or destructive operation request:\n` +
+          `> \`${promptPreview}\`\n\n` +
+          `Click **Confirm Deletion** to proceed or **Cancel** to abort. *(Auto-cancels in 60s)*`,
+        components: [actionRow]
+      });
+
+      try {
+        const interaction = await confirmMsg.awaitMessageComponent({
+          componentType: ComponentType.Button,
+          filter: (i) => i.user.id === message.author.id,
+          time: 60000
+        });
+
+        if (interaction.customId === 'cancel_deletion') {
+          await interaction.update({
+            content: `❌ **Operation Cancelled**: Deletion request was cancelled by <@${message.author.id}>.`,
+            components: []
+          });
+          return;
+        }
+
+        // Confirmed!
+        await interaction.update({
+          content: `🗑️ **Deletion Confirmed** by <@${message.author.id}>. Dispatching to AGY...`,
+          components: []
+        });
+      } catch {
+        // Timed out after 60s
+        await confirmMsg.edit({
+          content: `⏳ **Operation Cancelled**: Deletion confirmation timed out after 60 seconds.`,
+          components: []
+        }).catch(() => {});
+        return;
+      }
+    }
+
+    // 8. Execute AGY Prompt
     const sessionKey = message.channelId;
     const currentConvId = sessionMap.get(sessionKey);
 
