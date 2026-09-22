@@ -2,8 +2,10 @@ import assert from 'node:assert';
 import {
   convertMarkdownTablesToBullets,
   formatForDiscord,
+  getSanitizedEnvironment,
   hasExplicitConfirmationFlag,
   isDeletionIntent,
+  redactSecrets,
   splitDiscordMessage
 } from '../src/mainframe.js';
 
@@ -82,16 +84,21 @@ function runMainframeUnitTests() {
   console.log('✅ Headers demoted and mass mentions escaped.');
 
   // Test 8: Deletion intent detection
-  console.log('\nTest 8: Deletion intent detection');
+  console.log('\nTest 8: Deletion intent detection (including clear, clean, flush, prune, empty)');
   assert.strictEqual(isDeletionIntent('delete the temp file'), true);
   assert.strictEqual(isDeletionIntent('rm -rf node_modules'), true);
   assert.strictEqual(isDeletionIntent('remove old channel'), true);
   assert.strictEqual(isDeletionIntent('drop database test'), true);
   assert.strictEqual(isDeletionIntent('purge messages from yesterday'), true);
   assert.strictEqual(isDeletionIntent('wipe test artifacts'), true);
+  assert.strictEqual(isDeletionIntent('clear cache now'), true);
+  assert.strictEqual(isDeletionIntent('clean build directory'), true);
+  assert.strictEqual(isDeletionIntent('flush redis database'), true);
+  assert.strictEqual(isDeletionIntent('prune old containers'), true);
+  assert.strictEqual(isDeletionIntent('empty logs folder'), true);
   assert.strictEqual(isDeletionIntent('show current git status'), false);
   assert.strictEqual(isDeletionIntent('create a new file called app.ts'), false);
-  console.log('✅ Accurately detected deletion/destructive prompts.');
+  console.log('✅ Accurately detected all deletion/destructive/clear prompts.');
 
   // Test 9: Explicit confirmation flags
   console.log('\nTest 9: Explicit confirmation flag detection');
@@ -99,11 +106,59 @@ function runMainframeUnitTests() {
   assert.strictEqual(hasExplicitConfirmationFlag('delete logs -f'), true);
   assert.strictEqual(hasExplicitConfirmationFlag('rm -rf build --yes'), true);
   assert.strictEqual(hasExplicitConfirmationFlag('drop table -y'), true);
+  assert.strictEqual(hasExplicitConfirmationFlag('clear cache --confirm'), true);
   assert.strictEqual(hasExplicitConfirmationFlag('delete file.txt'), false);
   console.log('✅ Accurately detected explicit bypass flags.');
 
+  // Test 10: Secret and token redaction
+  console.log('\nTest 10: Secret and credential redaction');
+  const mockConfig = {
+    discordToken: 'MTE4NjIzNDU2Nzg5MDEyMzQ1Ng.G1xYzA.sampleFakeTokenForTestingOnly12345678',
+    authToken: 'c3fedb82a3c990263f6eb73f1d3e8e19',
+    allowedGuildIds: [],
+    port: 3000,
+    host: '127.0.0.1',
+    requireConfirmation: true,
+    maxMessageHistory: 100
+  };
+  const sensitiveOutput = 
+    `Connected with bot token MTE4NjIzNDU2Nzg5MDEyMzQ1Ng.G1xYzA.sampleFakeTokenForTestingOnly12345678 and auth token c3fedb82a3c990263f6eb73f1d3e8e19. ` +
+    `GitHub PAT: github_pat_TEST_TOKEN_FOR_UNIT_TESTING_PURPOSES_ONLY_000000000000000000000000000000000000000000000000000 ` +
+    `Authorization: Bearer secret_bearer_token_1234567890`;
+
+  const scrubbed = redactSecrets(sensitiveOutput, mockConfig);
+  assert.ok(!scrubbed.includes('c3fedb82a3c990263f6eb73f1d3e8e19'), 'MCP Auth token must be redacted');
+  assert.ok(!scrubbed.includes('github_pat_TEST_TOKEN_FOR_UNIT_TESTING'), 'GitHub PAT must be redacted');
+  assert.ok(!scrubbed.includes('secret_bearer_token_1234567890'), 'Bearer token must be redacted');
+  assert.ok(scrubbed.includes('[REDACTED_BOT_TOKEN]'), 'Must replace bot token with placeholder');
+  assert.ok(scrubbed.includes('[REDACTED_MCP_TOKEN]'), 'Must replace auth token with placeholder');
+  assert.ok(scrubbed.includes('[REDACTED_GITHUB_PAT]'), 'Must replace GitHub PAT with placeholder');
+
+  // Verify formatForDiscord also executes redaction
+  const formattedWithSecrets = formatForDiscord(sensitiveOutput, mockConfig);
+  assert.ok(!formattedWithSecrets.includes('c3fedb82a3c990263f6eb73f1d3e8e19'));
+  console.log('✅ Secrets, tokens, and credentials securely redacted.');
+
+  // Test 11: Child process sanitized environment
+  console.log('\nTest 11: Child process sanitized environment');
+  process.env.DISCORD_BOT_TOKEN = 'mock_bot_token';
+  process.env.MCP_AUTH_TOKEN = 'mock_mcp_token';
+  process.env.GITHUB_PAT = 'mock_github_pat';
+  process.env.CUSTOM_SECRET_KEY = 'super_secret';
+  process.env.DATABASE_PASSWORD = 'secret_password';
+
+  const cleanEnv = getSanitizedEnvironment();
+  assert.strictEqual(cleanEnv.DISCORD_BOT_TOKEN, undefined, 'DISCORD_BOT_TOKEN must not leak to child process');
+  assert.strictEqual(cleanEnv.MCP_AUTH_TOKEN, undefined, 'MCP_AUTH_TOKEN must not leak to child process');
+  assert.strictEqual(cleanEnv.GITHUB_PAT, undefined, 'GITHUB_PAT must not leak to child process');
+  assert.strictEqual(cleanEnv.CUSTOM_SECRET_KEY, undefined, 'Keys with "secret" must be dropped');
+  assert.strictEqual(cleanEnv.DATABASE_PASSWORD, undefined, 'Keys with "password" must be dropped');
+  assert.strictEqual(cleanEnv.PAGER, 'cat', 'PAGER must be configured');
+  assert.strictEqual(cleanEnv.TERM, 'xterm-256color', 'TERM must be configured');
+  console.log('✅ Child process environment stripped of all sensitive keys and credentials.');
+
   console.log('\n=====================================================');
-  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (9/9)');
+  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (11/11)');
   console.log('=====================================================\n');
 }
 

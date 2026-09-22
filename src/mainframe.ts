@@ -155,33 +155,72 @@ export function convertMarkdownTablesToBullets(text: string): string {
 }
 
 /**
+ * Redacts secrets, tokens, and credentials from text before outputting to Discord.
+ */
+export function redactSecrets(text: string, config?: AppConfig): string {
+  if (!text) return '';
+  let cleaned = text;
+
+  // 1. Redact configured application secrets if provided (or from env fallback)
+  const botToken = config?.discordToken || process.env.DISCORD_BOT_TOKEN;
+  if (botToken && botToken.length > 5) {
+    cleaned = cleaned.replaceAll(botToken, '[REDACTED_BOT_TOKEN]');
+  }
+  const mcpToken = config?.authToken || process.env.MCP_AUTH_TOKEN;
+  if (mcpToken && mcpToken.length > 5) {
+    cleaned = cleaned.replaceAll(mcpToken, '[REDACTED_MCP_TOKEN]');
+  }
+
+  // 2. Redact Discord Bot Token format (e.g. MTU0...bqDY or MFA token)
+  cleaned = cleaned.replace(/\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}\b/g, '[REDACTED_DISCORD_TOKEN]');
+  cleaned = cleaned.replace(/\bmfa\.[A-Za-z0-9_-]{80,100}\b/g, '[REDACTED_MFA_TOKEN]');
+
+  // 3. Redact GitHub Personal Access Tokens (classic ghp_ and fine-grained github_pat_)
+  cleaned = cleaned.replace(/\bgithub_pat_[A-Za-z0-9_]{50,}\b/g, '[REDACTED_GITHUB_PAT]');
+  cleaned = cleaned.replace(/\bghp_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
+  cleaned = cleaned.replace(/\bgh[ousr]_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
+
+  // 4. Redact Bearer authorization tokens
+  cleaned = cleaned.replace(/Bearer\s+[A-Za-z0-9_\-\.]{16,}/gi, 'Bearer [REDACTED_TOKEN]');
+
+  // 5. Redact AI API keys & AWS access keys
+  cleaned = cleaned.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b/g, '[REDACTED_AI_API_KEY]');
+  cleaned = cleaned.replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_AWS_KEY]');
+
+  return cleaned;
+}
+
+/**
  * Filter and format raw output for clean, polished Discord display.
  */
-export function formatForDiscord(raw: string): string {
+export function formatForDiscord(raw: string, config?: AppConfig): string {
   if (!raw) return '';
 
   let text = raw;
 
-  // 1. Strip ANSI escape sequences (terminal colors, cursor movements)
+  // 1. Redact secrets, tokens, and credentials
+  text = redactSecrets(text, config);
+
+  // 2. Strip ANSI escape sequences (terminal colors, cursor movements)
   text = text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
-  // 2. Strip internal system / reasoning tags
+  // 3. Strip internal system / reasoning tags
   text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
   text = text.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
   text = text.replace(/<context>[\s\S]*?<\/context>/gi, '');
   text = text.replace(/<system>[\s\S]*?<\/system>/gi, '');
 
-  // 3. Prevent accidental mass mentions
+  // 4. Prevent accidental mass mentions
   text = text.replace(/@(everyone|here)/g, '@\u200b$1');
 
-  // 4. Convert markdown tables into bulleted lists
+  // 5. Convert markdown tables into bulleted lists
   text = convertMarkdownTablesToBullets(text);
 
-  // 5. Demote oversized # and ## headings to ###
+  // 6. Demote oversized # and ## headings to ###
   text = text.replace(/^#\s+(.+)$/gm, '### $1');
   text = text.replace(/^##\s+(.+)$/gm, '### $1');
 
-  // 6. Collapse excessive blank lines
+  // 7. Collapse excessive blank lines
   text = text.replace(/\n{3,}/g, '\n\n');
 
   return text.trim();
@@ -191,7 +230,7 @@ export function formatForDiscord(raw: string): string {
  * Detects whether a prompt expresses a deletion or destructive intent
  */
 export function isDeletionIntent(prompt: string): boolean {
-  const DELETION_REGEX = /\b(delete|del|rm|remove|drop|truncate|purge|destroy|unlink|wipe|erase)\b/i;
+  const DELETION_REGEX = /\b(delete|del|rm|remove|drop|truncate|purge|destroy|unlink|wipe|erase|clear|clean|flush|prune|empty|shred|format|discard)\b/i;
   return DELETION_REGEX.test(prompt);
 }
 
@@ -200,6 +239,47 @@ export function isDeletionIntent(prompt: string): boolean {
  */
 export function hasExplicitConfirmationFlag(prompt: string): boolean {
   return /(--force|-f|--confirm|--yes|-y)\b/i.test(prompt);
+}
+
+/**
+ * Generates a sanitized environment object for child process execution,
+ * stripping sensitive tokens, credentials, and API keys.
+ */
+export function getSanitizedEnvironment(): NodeJS.ProcessEnv {
+  const SENSITIVE_KEYS = new Set([
+    'DISCORD_BOT_TOKEN',
+    'MCP_AUTH_TOKEN',
+    'GITHUB_PAT',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_SESSION_TOKEN',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'GEMINI_API_KEY'
+  ]);
+
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const [key, val] of Object.entries(process.env)) {
+    if (val === undefined) continue;
+    const lowerKey = key.toLowerCase();
+    // Omit sensitive keys or variables containing token/secret/password/auth
+    if (
+      SENSITIVE_KEYS.has(key) ||
+      lowerKey.includes('token') ||
+      lowerKey.includes('secret') ||
+      lowerKey.includes('password') ||
+      lowerKey.includes('auth')
+    ) {
+      continue;
+    }
+    sanitized[key] = val;
+  }
+
+  sanitized['PAGER'] = 'cat';
+  sanitized['TERM'] = 'xterm-256color';
+  return sanitized;
 }
 
 /**
@@ -231,11 +311,7 @@ export async function runAgyCommand(
         cwd,
         timeout: 300000, // 5 min timeout
         maxBuffer: 15 * 1024 * 1024,
-        env: {
-          ...process.env,
-          PAGER: 'cat',
-          TERM: 'xterm-256color'
-        }
+        env: getSanitizedEnvironment()
       },
       (err, stdout, stderr) => {
         if (err && !stdout) {
@@ -336,14 +412,36 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       return;
     }
 
-    // 6. Handle Special Helper Commands
+    // 6. Ensure Execution Occurs in a Thread if called in #mainframe-channel
+    let targetChannel: TextBasedChannel = message.channel;
+    if (!message.channel.isThread()) {
+      try {
+        if (message.hasThread && message.thread) {
+          targetChannel = message.thread;
+        } else if ('startThread' in message && typeof message.startThread === 'function') {
+          const promptSummary = prompt.replace(/[\r\n]+/g, ' ').trim();
+          const cleanName = promptSummary.length > 50
+            ? `${promptSummary.slice(0, 47)}...`
+            : (promptSummary || 'AGY Session');
+          targetChannel = await message.startThread({
+            name: `🤖 ${cleanName}`,
+            autoArchiveDuration: 60
+          });
+        }
+      } catch (threadErr: any) {
+        console.error('[Mainframe] Thread creation failed, falling back to message channel:', threadErr.message);
+        targetChannel = message.channel;
+      }
+    }
+
+    // 7. Handle Special Helper Commands
     const lowerPrompt = prompt.toLowerCase();
 
     if (lowerPrompt === 'help' || lowerPrompt === '--help') {
-      await message.reply(
+      await (targetChannel as any).send(
         `🖥️ **Antigravity Mainframe Bridge**\n\n` +
         `**Commands:**\n` +
-        `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains context)\n` +
+        `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains context in thread)\n` +
         `• \`${prefix} new\` or \`${prefix} reset\` — Start a fresh conversation\n` +
         `• \`${prefix} status\` — View active session info and bridge status\n` +
         `• \`${prefix} help\` — Show this help message\n\n` +
@@ -353,8 +451,8 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
     }
 
     if (lowerPrompt === 'status') {
-      const activeId = sessionMap.get(message.channelId) || '(No active session)';
-      await message.reply(
+      const activeId = sessionMap.get(targetChannel.id) || '(No active session)';
+      await (targetChannel as any).send(
         `🖥️ **Mainframe Status:**\n` +
         `• **Target Channel:** #${targetChannelName}\n` +
         `• **Active Conversation ID:** \`${activeId}\`\n` +
@@ -366,17 +464,17 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
     }
 
     if (lowerPrompt === 'new' || lowerPrompt === 'reset') {
-      sessionMap.delete(message.channelId);
-      await message.reply('🔄 **Session Reset**: Next message will begin a brand-new conversation session with AGY.');
+      sessionMap.delete(targetChannel.id);
+      await (targetChannel as any).send('🔄 **Session Reset**: Next message will begin a brand-new conversation session with AGY.');
       return;
     }
 
     if (!prompt) {
-      await message.reply(`Please provide a prompt after \`${prefix}\`. Example: \`${prefix} what is the current git status?\``);
+      await (targetChannel as any).send(`Please provide a prompt after \`${prefix}\`. Example: \`${prefix} what is the current git status?\``);
       return;
     }
 
-    // 7. Check for Deletion / Destructive Intent & Require Confirmation
+    // 8. Check for Deletion / Destructive Intent & Require Confirmation
     if (isDeletionIntent(prompt) && !hasExplicitConfirmationFlag(prompt)) {
       const confirmButton = new ButtonBuilder()
         .setCustomId('confirm_deletion')
@@ -393,7 +491,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmButton, cancelButton);
 
       const promptPreview = prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt;
-      const confirmMsg = await message.reply({
+      const confirmMsg = await (targetChannel as any).send({
         content:
           `⚠️ **Deletion Confirmation Required**\n` +
           `Your prompt contains a deletion or destructive operation request:\n` +
@@ -405,7 +503,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       try {
         const interaction = await confirmMsg.awaitMessageComponent({
           componentType: ComponentType.Button,
-          filter: (i) => i.user.id === message.author.id,
+          filter: (i: any) => i.user.id === message.author.id,
           time: 60000
         });
 
@@ -432,27 +530,27 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       }
     }
 
-    // 8. Execute AGY Prompt
-    const sessionKey = message.channelId;
+    // 9. Execute AGY Prompt in target thread / channel
+    const sessionKey = targetChannel.id;
     const currentConvId = sessionMap.get(sessionKey);
 
-    // Add working reaction indicator
+    // Add working reaction indicator to original message
     try {
       await message.react('⚙️');
     } catch {
       // Non-fatal if reaction fails
     }
 
-    // Send typing indicators periodically while AGY thinks and executes
+    // Send typing indicators periodically in targetChannel while AGY thinks and executes
     const typingInterval = setInterval(() => {
-      if ('sendTyping' in message.channel && typeof (message.channel as any).sendTyping === 'function') {
-        (message.channel as any).sendTyping().catch(() => {});
+      if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
+        (targetChannel as any).sendTyping().catch(() => {});
       }
     }, 7000);
 
     try {
-      if ('sendTyping' in message.channel && typeof (message.channel as any).sendTyping === 'function') {
-        await (message.channel as any).sendTyping();
+      if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
+        await (targetChannel as any).sendTyping();
       }
 
       const result = await runAgyCommand(prompt, currentConvId, agyBin);
@@ -464,7 +562,8 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
           await message.reactions.removeAll();
           await message.react('❌');
         } catch {}
-        await message.reply(`❌ **AGY Execution Error**:\n\`\`\`text\n${result.error}\n\`\`\``);
+        const safeError = redactSecrets(result.error, config);
+        await (targetChannel as any).send(`❌ **AGY Execution Error**:\n\`\`\`text\n${safeError}\n\`\`\``);
         return;
       }
 
@@ -478,16 +577,12 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         await message.react('✅');
       } catch {}
 
-      // Format output cleanly for Discord and split into safe chunks
-      const formatted = formatForDiscord(result.response || '(Done with no output)');
+      // Format output cleanly for Discord, redact secrets, and split into safe chunks
+      const formatted = formatForDiscord(result.response || '(Done with no output)', config);
       const chunks = splitDiscordMessage(formatted, 1900);
 
-      for (let i = 0; i < chunks.length; i++) {
-        if (i === 0) {
-          await message.reply(chunks[i]);
-        } else {
-          await (message.channel as any).send(chunks[i]);
-        }
+      for (const chunk of chunks) {
+        await (targetChannel as any).send(chunk);
       }
     } catch (err: any) {
       clearInterval(typingInterval);
@@ -495,7 +590,8 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         await message.reactions.removeAll();
         await message.react('❌');
       } catch {}
-      await message.reply(`❌ **Unexpected Error**: ${err.message || String(err)}`);
+      const safeErr = redactSecrets(err.message || String(err), config);
+      await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
     }
   });
 }
