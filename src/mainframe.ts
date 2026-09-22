@@ -70,6 +70,116 @@ export function splitDiscordMessage(text: string, maxLength = 1900): string[] {
 }
 
 /**
+ * Converts markdown tables to clean Discord-friendly bulleted lists.
+ * Preserves tables that are enclosed within code blocks.
+ */
+export function convertMarkdownTablesToBullets(text: string): string {
+  const lines = text.split('\n');
+  const result: string[] = [];
+  let inCodeBlock = false;
+  let inTable = false;
+  let headers: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    // Check code blocks
+    if (trimmed.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      result.push(rawLine);
+      continue;
+    }
+
+    if (inCodeBlock) {
+      result.push(rawLine);
+      continue;
+    }
+
+    // Check if line looks like a table row: starts and ends with |
+    if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.includes('|')) {
+      const cells = trimmed
+        .slice(1, -1)
+        .split('|')
+        .map(c => c.trim());
+
+      // Check if separator line (| --- | :---: | --- |)
+      if (cells.every(c => /^:?-+:?$/.test(c))) {
+        inTable = true;
+        continue;
+      }
+
+      if (!inTable) {
+        // Potential header row: peek ahead to verify next line is separator
+        const nextLine = lines[i + 1]?.trim();
+        if (nextLine && nextLine.startsWith('|') && nextLine.includes('-')) {
+          headers = cells;
+          continue;
+        } else {
+          result.push(rawLine);
+          headers = [];
+          continue;
+        }
+      }
+
+      // We are in the table body rows
+      if (headers.length > 0) {
+        if (headers.length === 2) {
+          result.push(`• **${cells[0]}:** ${cells[1] || ''}`);
+        } else {
+          const formattedCells = cells.map((cell, idx) => {
+            const h = headers[idx] ? `**${headers[idx]}:** ` : '';
+            return `${h}${cell}`;
+          });
+          result.push(`• ${formattedCells.join(' • ')}`);
+        }
+      } else {
+        result.push(`• ${cells.join(' | ')}`);
+      }
+    } else {
+      inTable = false;
+      headers = [];
+      result.push(rawLine);
+    }
+  }
+
+  return result.join('\n');
+}
+
+/**
+ * Filter and format raw output for clean, polished Discord display.
+ */
+export function formatForDiscord(raw: string): string {
+  if (!raw) return '';
+
+  let text = raw;
+
+  // 1. Strip ANSI escape sequences (terminal colors, cursor movements)
+  text = text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+
+  // 2. Strip internal system / reasoning tags
+  text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+  text = text.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
+  text = text.replace(/<context>[\s\S]*?<\/context>/gi, '');
+  text = text.replace(/<system>[\s\S]*?<\/system>/gi, '');
+
+  // 3. Prevent accidental mass mentions
+  text = text.replace(/@(everyone|here)/g, '@\u200b$1');
+
+  // 4. Convert markdown tables into bulleted lists
+  text = convertMarkdownTablesToBullets(text);
+
+  // 5. Demote oversized # and ## headings to ###
+  text = text.replace(/^#\s+(.+)$/gm, '### $1');
+  text = text.replace(/^##\s+(.+)$/gm, '### $1');
+
+  // 6. Collapse excessive blank lines
+  text = text.replace(/\n{3,}/g, '\n\n');
+
+  return text.trim();
+}
+
+/**
  * Executes a prompt against the AGY CLI non-interactively in json mode
  */
 export async function runAgyCommand(
@@ -289,9 +399,9 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         await message.react('✅');
       } catch {}
 
-      // Split response into Discord-safe chunks
-      const responseText = result.response || '(Done with no output)';
-      const chunks = splitDiscordMessage(responseText, 1900);
+      // Format output cleanly for Discord and split into safe chunks
+      const formatted = formatForDiscord(result.response || '(Done with no output)');
+      const chunks = splitDiscordMessage(formatted, 1900);
 
       for (let i = 0; i < chunks.length; i++) {
         if (i === 0) {
