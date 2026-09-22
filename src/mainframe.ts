@@ -294,6 +294,8 @@ export async function runAgyCommand(
   return new Promise((resolve) => {
     const args = [
       '--dangerously-skip-permissions',
+      '--add-dir',
+      cwd,
       '--output-format',
       'json'
     ];
@@ -302,7 +304,12 @@ export async function runAgyCommand(
       args.push('--conversation', conversationId);
     }
 
-    args.push('-p', prompt);
+    // Explicitly enforce discord-display skill guidelines for Discord active sessions
+    const sessionPrompt = conversationId
+      ? prompt
+      : `[Context: Active Discord session in #mainframe-channel. Strictly adhere to discord-display skill guidelines: use ### headers, emoji bullets, no markdown tables, concise direct tone]\n\n${prompt}`;
+
+    args.push('-p', sessionPrompt);
 
     execFile(
       agyBin,
