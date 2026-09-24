@@ -1,4 +1,4 @@
-# Workspace Guidelines for Moon-Link & Mainframe Bridge
+# Workspace Guidelines for Hyposea Agent (Mainframe Bridge)
 
 When executing tasks or responding through the Discord Mainframe Bridge (`#mainframe-channel`):
 

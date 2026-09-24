@@ -361,7 +361,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
 
   const targetChannelName = (config.mainframeChannel || 'mainframe-channel').toLowerCase();
   const prefix = (config.mainframePrefix || '!agy').toLowerCase();
-  const authorizedUsers = new Set(config.mainframeAuthorizedUsers || ['515099684893622277']);
+  const authorizedUsers = new Set(config.mainframeAuthorizedUsers || []);
   const agyBin = config.agyBinPath || '/home/ubuntu/.local/bin/agy';
 
   console.error(`[Mainframe] Bridge initialized. Listening on #${targetChannelName} for prefix "${prefix}" or @mentions.`);
