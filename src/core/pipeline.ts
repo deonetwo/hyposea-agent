@@ -7,6 +7,7 @@ import { AgentRunner } from '../runners/runner.js';
 import { AgyRunner } from '../runners/agy.js';
 import { AuditModule } from '../modules/audit/index.js';
 import { GuardModule } from '../modules/guard/index.js';
+import { ContextBuilder } from './context-builder.js';
 import {
   formatForDiscord,
   formatQuotaForDiscord,
@@ -22,6 +23,7 @@ export interface PipelineOptions {
   bus?: EventBus;
   audit?: AuditModule;
   guard?: GuardModule;
+  contextBuilder?: ContextBuilder;
   config: AppConfig;
 }
 
@@ -33,6 +35,7 @@ export class Pipeline {
   private bus: EventBus;
   private audit: AuditModule;
   private guard: GuardModule;
+  private contextBuilder: ContextBuilder;
   private config: AppConfig;
 
   constructor(options: PipelineOptions) {
@@ -44,9 +47,15 @@ export class Pipeline {
     this.bus = options.bus || new EventBus();
     this.audit = options.audit || new AuditModule({ dbPath: this.config.dbPath });
     this.guard = options.guard || new GuardModule({ allowedDirectories: [this.config.workDir] });
+    this.contextBuilder = options.contextBuilder || new ContextBuilder();
 
     // Register audit listeners on the event bus
     this.audit.register(this.bus);
+
+    // Register scheduler listener for proactive tasks
+    this.bus.on('job.due', async (job) => {
+      await this.handleJobDue(job);
+    });
   }
 
   public getEventBus(): EventBus {
@@ -59,6 +68,10 @@ export class Pipeline {
 
   public getGuardModule(): GuardModule {
     return this.guard;
+  }
+
+  public getContextBuilder(): ContextBuilder {
+    return this.contextBuilder;
   }
 
   public async start(): Promise<void> {
@@ -180,9 +193,13 @@ export class Pipeline {
       try {
         if (msg.sendTyping) await msg.sendTyping().catch(() => {});
 
+        // Build session prompt with memory context if starting a new session
         const sessionPrompt = currentConvId
           ? prompt
-          : `[Context: Active Discord session in #${this.config.mainframeChannel}. Strictly adhere to discord-display skill guidelines: use ### headers, emoji bullets, no markdown tables, concise direct tone]\n\n${prompt}`;
+          : this.contextBuilder.buildInitialPrompt(prompt, this.config.mainframeChannel);
+
+        // Record user turn in FTS5
+        this.contextBuilder.recordTurn(sessionKey, 'user', prompt);
 
         const result = await this.runner.run({
           prompt: sessionPrompt,
@@ -220,6 +237,11 @@ export class Pipeline {
           });
         }
 
+        // Record assistant turn in FTS5
+        if (result.response) {
+          this.contextBuilder.recordTurn(sessionKey, 'assistant', result.response);
+        }
+
         await this.bus.emit('run.after', {
           message: msg,
           sessionKey,
@@ -242,6 +264,34 @@ export class Pipeline {
         if (msg.react) await msg.react('❌').catch(() => {});
         const safeErr = redactSecrets(err.message || String(err), this.config);
         await this.sendResponse(msg.channelId, `❌ **Unexpected Error**: ${safeErr}`);
+      }
+    });
+  }
+
+  private async handleJobDue(job: {
+    jobId: string;
+    task: string;
+    target: { channelId: string };
+  }): Promise<void> {
+    const queueKey = `job-${job.jobId}`;
+
+    await this.queue.enqueue(queueKey, async (signal: AbortSignal) => {
+      try {
+        const scheduledPrompt = `[Scheduled Background Task: ${job.task}]\n\nExecute the task concisely following discord-display guidelines.`;
+
+        const result = await this.runner.run({
+          prompt: scheduledPrompt,
+          cwd: this.config.workDir,
+          signal
+        });
+
+        if (result.response) {
+          const header = `⏰ **Scheduled Task Result** [${job.jobId}]:\n`;
+          const formatted = formatForDiscord(result.response, this.config);
+          await this.sendResponse(job.target.channelId, `${header}${formatted}`);
+        }
+      } catch (err: any) {
+        console.error(`[Pipeline] Failed to execute scheduled job ${job.jobId}:`, err.message);
       }
     });
   }
