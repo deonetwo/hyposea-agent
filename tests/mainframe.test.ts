@@ -1,15 +1,21 @@
 import assert from 'node:assert';
 import {
   convertMarkdownTablesToBullets,
+  fetchModelQuota,
   formatForDiscord,
+  formatQuotaForDiscord,
+  getQuotaStatusEmoji,
   getSanitizedEnvironment,
   hasExplicitConfirmationFlag,
   isDeletionIntent,
+  isModelQuotaCommand,
+  parseTabSeparatedQuota,
   redactSecrets,
+  renderProgressBar,
   splitDiscordMessage
 } from '../src/mainframe.js';
 
-function runMainframeUnitTests() {
+async function runMainframeUnitTests() {
   console.log('\n--- Running Mainframe Unit Tests ---\n');
 
   // Test 1: Short message doesn't split
@@ -157,9 +163,92 @@ function runMainframeUnitTests() {
   assert.strictEqual(cleanEnv.TERM, 'xterm-256color', 'TERM must be configured');
   console.log('✅ Child process environment stripped of all sensitive keys and credentials.');
 
+  // Test 12: Progress bar rendering and status emoji calculation
+  console.log('\nTest 12: Progress bar rendering and quota status emojis');
+  assert.strictEqual(renderProgressBar(1.0, 10), '[██████████]');
+  assert.strictEqual(renderProgressBar(0.0, 10), '[░░░░░░░░░░]');
+  assert.strictEqual(renderProgressBar(0.5, 10), '[█████░░░░░]');
+  assert.strictEqual(renderProgressBar(0.88, 10), '[█████████░]');
+  assert.strictEqual(renderProgressBar(-0.5, 10), '[░░░░░░░░░░]', 'Negative clamped to 0');
+  assert.strictEqual(renderProgressBar(1.5, 10), '[██████████]', 'Overflow clamped to 1');
+
+  assert.strictEqual(getQuotaStatusEmoji(0.88), '🟢');
+  assert.strictEqual(getQuotaStatusEmoji(0.50), '🟢');
+  assert.strictEqual(getQuotaStatusEmoji(0.49), '🟡');
+  assert.strictEqual(getQuotaStatusEmoji(0.20), '🟡');
+  assert.strictEqual(getQuotaStatusEmoji(0.19), '🔴');
+  assert.strictEqual(getQuotaStatusEmoji(0.00), '🔴');
+  console.log('✅ Progress bar and status indicators computed correctly.');
+
+  // Test 13: Tab/space delimited quota parser
+  console.log('\nTest 13: Raw / tab-separated quota table parsing');
+  const sampleQuotaText = 
+`Quota:
+Gemini Models          Weekly Limit Remaining     88%   2026-09-30T05:43:04Z
+Gemini Models          Five Hour Limit Remaining  59%   2026-09-24T16:10:26Z
+Claude and GPT models  Weekly Limit Remaining     64%   2026-09-25T10:59:18Z
+Claude and GPT models  Five Hour Limit Remaining  100%  2026-09-24T20:18:37Z`;
+
+  const parsedQuota = parseTabSeparatedQuota(sampleQuotaText);
+  assert.strictEqual(parsedQuota.groups.length, 2);
+  assert.strictEqual(parsedQuota.groups[0].name, 'Gemini Models');
+  assert.strictEqual(parsedQuota.groups[0].buckets.length, 2);
+  assert.strictEqual(parsedQuota.groups[0].buckets[0].remaining_fraction, 0.88);
+  assert.strictEqual(parsedQuota.groups[0].buckets[0].reset_time, '2026-09-30T05:43:04Z');
+  assert.strictEqual(parsedQuota.groups[1].name, 'Claude and GPT models');
+  assert.strictEqual(parsedQuota.groups[1].buckets[0].remaining_fraction, 0.64);
+  assert.strictEqual(parsedQuota.groups[1].buckets[1].remaining_fraction, 1);
+  console.log('✅ Tab-separated and spaced quota text parsed accurately.');
+
+  // Test 14: Model quota command trigger detection
+  console.log('\nTest 14: Model quota command trigger detection');
+  assert.strictEqual(isModelQuotaCommand('quota'), true);
+  assert.strictEqual(isModelQuotaCommand('QUOTA'), true);
+  assert.strictEqual(isModelQuotaCommand('!agy quota'), false, 'Should receive prompt without prefix');
+  assert.strictEqual(isModelQuotaCommand('/quota'), true);
+  assert.strictEqual(isModelQuotaCommand('model-quota'), true);
+  assert.strictEqual(isModelQuotaCommand('modelquota'), true);
+  assert.strictEqual(isModelQuotaCommand('model quota'), true);
+  assert.strictEqual(isModelQuotaCommand('models quota'), true);
+  assert.strictEqual(isModelQuotaCommand('view model quota'), true);
+  assert.strictEqual(isModelQuotaCommand('usage'), true);
+  assert.strictEqual(isModelQuotaCommand('/usage'), true);
+  assert.strictEqual(isModelQuotaCommand('limits'), true);
+  assert.strictEqual(isModelQuotaCommand('quota --json'), true);
+  assert.strictEqual(isModelQuotaCommand('model-quota --raw'), true);
+  assert.strictEqual(isModelQuotaCommand('status'), false);
+  assert.strictEqual(isModelQuotaCommand('help'), false);
+  assert.strictEqual(isModelQuotaCommand('how to increase quota'), false);
+  console.log('✅ Accurately recognized model quota commands and flags.');
+
+  // Test 15: Discord quota formatting
+  console.log('\nTest 15: Discord quota formatting (discord-display compliant)');
+  const formattedDiscordQuota = formatQuotaForDiscord(parsedQuota);
+  assert.ok(formattedDiscordQuota.startsWith('### 📊 Model Quota & Usage Limits'));
+  assert.ok(formattedDiscordQuota.includes('**🤖 Gemini Models**'));
+  assert.ok(formattedDiscordQuota.includes('**Weekly Limit Remaining:** 🟢 `88%` [█████████░]'));
+  assert.ok(formattedDiscordQuota.includes('**🧠 Claude and GPT models**'));
+  assert.ok(!formattedDiscordQuota.includes('|'), 'Markdown tables must be avoided');
+  assert.ok(!/^#\s+/m.test(formattedDiscordQuota), 'H1 header must not be used');
+  assert.ok(!/^##\s+/m.test(formattedDiscordQuota), 'H2 header must not be used');
+  console.log('✅ Formatted Discord display strictly adheres to discord-display skill.');
+
+  // Test 16: Live fetchModelQuota against AGY CLI
+  console.log('\nTest 16: Live fetchModelQuota against AGY CLI binary');
+  const liveResult = await fetchModelQuota();
+  assert.strictEqual(liveResult.success, true, `fetchModelQuota failed: ${liveResult.error}`);
+  assert.ok(liveResult.data || liveResult.rawText, 'Must have data or rawText');
+  if (liveResult.data) {
+    assert.ok(liveResult.data.groups.length > 0, 'Should have at least 1 group');
+  }
+  console.log('✅ Successfully queried live model quota from AGY CLI.');
+
   console.log('\n=====================================================');
-  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (11/11)');
+  console.log('🎉 ALL MAINFRAME UNIT TESTS PASSED (16/16)');
   console.log('=====================================================\n');
 }
 
-runMainframeUnitTests();
+runMainframeUnitTests().catch((err) => {
+  console.error('❌ Test suite failed:', err);
+  process.exit(1);
+});

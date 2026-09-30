@@ -30,12 +30,28 @@ It enables team members and autonomous workflows to issue prompts, execute tasks
 
 - **Bidirectional Discord ↔ AGY Bridge**: Listens for `!agy` commands, bot @mentions, and replies within active threads.
 - **Session Continuity**: Preserves conversation history (`conversationId`) per thread/channel across multi-turn interactions.
+- **Model Quota & Limits Command**: Instantly inspect model quota (Gemini, Claude, GPT), weekly/5-hour remaining capacity, and dynamic refresh timers via `!agy quota`.
 - **Security & Authorization Whitelist**:
   - Restricts command execution to authorized Discord User IDs defined in `MAINFRAME_AUTHORIZED_USERS`.
   - Blocks prompt injection, secret exposure, and unwhitelisted execution.
   - Sanitizes subprocess environment variables, stripping sensitive system tokens from leaking to child processes.
   - Destructive action guardrails with interactive Discord confirmation buttons.
 - **Discord-Optimized Formatting**: Programmatic Markdown filtering following the `discord-display` skill (see `.agents/skills/discord-display/SKILL.md` and `AGENTS.md`). Converts complex tables into readable key-value bullets and splits large messages cleanly without breaking code blocks.
+
+---
+
+## ⌨️ Bot Commands
+
+Inside `#mainframe-channel` (or in threads under it, or via @mention):
+
+• **`!agy <prompt>`** — Execute a prompt or coding task against AGY CLI (maintains session context in thread)  
+• **`!agy quota`** (or `!agy model-quota`, `usage`) — View model quota status, visual progress bars, remaining percentage, and Discord countdown timers for limit resets  
+• **`!agy quota --json`** — Return raw JSON payload from AGY CLI quota endpoint  
+• **`!agy status`** — Inspect active bridge status, target channel, conversation ID, and operator ID  
+• **`!agy new`** / **`!agy reset`** — Clear current channel thread session and begin a fresh AGY conversation  
+• **`!agy help`** — Show command list and usage tips  
+
+*Note: Inside any thread created under `#mainframe-channel`, authorized users can run `quota`, `status`, `help`, or prompts directly without the `!agy` prefix.*
 
 ---
 

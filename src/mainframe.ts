@@ -10,11 +10,38 @@ import {
 } from 'discord.js';
 import { AppConfig } from './config.js';
 
-interface AgyRunResult {
+export interface AgyRunResult {
   response: string;
   conversationId?: string;
   durationSeconds?: number;
   tokensUsed?: number;
+  error?: string;
+}
+
+export interface QuotaBucket {
+  id: string;
+  name: string;
+  description?: string;
+  window?: string;
+  remaining_fraction: number;
+  reset_time?: string;
+}
+
+export interface QuotaGroup {
+  name: string;
+  description?: string;
+  buckets: QuotaBucket[];
+}
+
+export interface ModelQuotaData {
+  description?: string;
+  groups: QuotaGroup[];
+}
+
+export interface ModelQuotaResult {
+  success: boolean;
+  data?: ModelQuotaData;
+  rawText?: string;
   error?: string;
 }
 
@@ -289,7 +316,7 @@ export async function runAgyCommand(
   prompt: string,
   conversationId?: string,
   agyBin = '/home/ubuntu/.local/bin/agy',
-  cwd = '/home/ubuntu/moon-link'
+  cwd = process.cwd()
 ): Promise<AgyRunResult> {
   return new Promise((resolve) => {
     const args = [
@@ -343,6 +370,229 @@ export async function runAgyCommand(
           return resolve({
             response: rawOutput || (stderr ? stderr.trim() : '(Empty response)'),
             conversationId
+          });
+        }
+      }
+    );
+  });
+}
+
+/**
+ * Renders a visual text-based progress bar (e.g. [████████░░])
+ */
+export function renderProgressBar(fraction: number, length = 10): string {
+  const safeFraction = typeof fraction === 'number' && !isNaN(fraction) ? fraction : 0;
+  const clamped = Math.max(0, Math.min(1, safeFraction));
+  const filled = Math.round(clamped * length);
+  const empty = length - filled;
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}]`;
+}
+
+/**
+ * Returns a color-coded status indicator emoji based on remaining quota fraction
+ */
+export function getQuotaStatusEmoji(fraction: number): string {
+  if (typeof fraction !== 'number' || isNaN(fraction)) return '⚪';
+  if (fraction >= 0.5) return '🟢';
+  if (fraction >= 0.2) return '🟡';
+  return '🔴';
+}
+
+/**
+ * Parses tab-separated or aligned space table output from agy -p "/quota"
+ */
+export function parseTabSeparatedQuota(text: string): ModelQuotaData {
+  const groupsMap = new Map<string, QuotaBucket[]>();
+  const lines = text.split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.toLowerCase().startsWith('quota:')) continue;
+    const parts = trimmed.split(/\t+|\s{2,}/);
+    if (parts.length >= 3) {
+      const groupName = parts[0].trim();
+      const bucketName = parts[1].trim();
+      const pctMatch = parts[2].match(/(\d+)%/);
+      const remaining_fraction = pctMatch ? parseInt(pctMatch[1], 10) / 100 : 1;
+      const reset_time = parts[3] ? parts[3].trim() : undefined;
+
+      const bucket: QuotaBucket = {
+        id: bucketName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+        name: bucketName,
+        remaining_fraction,
+        reset_time
+      };
+
+      if (!groupsMap.has(groupName)) {
+        groupsMap.set(groupName, []);
+      }
+      groupsMap.get(groupName)!.push(bucket);
+    }
+  }
+
+  const groups: QuotaGroup[] = Array.from(groupsMap.entries()).map(([name, buckets]) => ({
+    name,
+    buckets
+  }));
+
+  return { groups };
+}
+
+/**
+ * Formats structured model quota data into Discord-first markdown
+ */
+export function formatQuotaForDiscord(data: ModelQuotaData): string {
+  const lines: string[] = [];
+
+  lines.push('### 📊 Model Quota & Usage Limits\n');
+
+  if (!data.groups || data.groups.length === 0) {
+    lines.push('• No active model quota buckets found.');
+    return lines.join('\n');
+  }
+
+  for (const group of data.groups) {
+    const isGemini = group.name.toLowerCase().includes('gemini');
+    const groupEmoji = isGemini ? '🤖' : '🧠';
+    lines.push(`**${groupEmoji} ${group.name}**`);
+    if (group.description) {
+      lines.push(`• *${group.description}*`);
+    }
+
+    for (const bucket of group.buckets) {
+      const fraction = typeof bucket.remaining_fraction === 'number' && !isNaN(bucket.remaining_fraction)
+        ? bucket.remaining_fraction
+        : 1;
+      const pct = Math.round(fraction * 100);
+      const emoji = getQuotaStatusEmoji(fraction);
+      const bar = renderProgressBar(fraction, 10);
+
+      let resetPart = '';
+      if (bucket.reset_time) {
+        const resetDate = new Date(bucket.reset_time);
+        const unixSeconds = Math.floor(resetDate.getTime() / 1000);
+        if (!isNaN(unixSeconds) && unixSeconds > 0) {
+          resetPart = ` • Resets <t:${unixSeconds}:R>`;
+        }
+      }
+
+      lines.push(`• **${bucket.name}:** ${emoji} \`${pct}%\` ${bar}${resetPart}`);
+      if (bucket.description) {
+        lines.push(`  ↳ *${bucket.description}*`);
+      }
+    }
+    lines.push('');
+  }
+
+  lines.push('⚡ *Within each group, models share a weekly and 5-hour limit. Quota is consumed proportionally based on token cost.*');
+
+  return lines.join('\n').trim();
+}
+
+/**
+ * Checks if a user prompt is intended to invoke the model quota command
+ */
+export function isModelQuotaCommand(prompt: string): boolean {
+  const clean = prompt.trim().toLowerCase();
+  const triggers = [
+    'quota',
+    '/quota',
+    'model-quota',
+    'modelquota',
+    'model quota',
+    'models-quota',
+    'models quota',
+    'usage',
+    '/usage',
+    'model usage',
+    'view quota',
+    'view model quota',
+    'view models quota',
+    'check quota',
+    'show quota',
+    'get quota',
+    'limits',
+    'model limits',
+    'quota limits'
+  ];
+
+  return triggers.some(t => clean === t || clean.startsWith(`${t} `));
+}
+
+/**
+ * Fetches model quota directly from the AGY CLI non-interactively
+ */
+export async function fetchModelQuota(
+  agyBin = '/home/ubuntu/.local/bin/agy',
+  cwd = process.cwd()
+): Promise<ModelQuotaResult> {
+  return new Promise((resolve) => {
+    const args = [
+      '--dangerously-skip-permissions',
+      '--add-dir',
+      cwd,
+      '--output-format',
+      'json',
+      '-p',
+      '/quota'
+    ];
+
+    execFile(
+      agyBin,
+      args,
+      {
+        cwd,
+        timeout: 45000,
+        maxBuffer: 10 * 1024 * 1024,
+        env: getSanitizedEnvironment()
+      },
+      (err, stdout, stderr) => {
+        if (err && !stdout) {
+          return resolve({
+            success: false,
+            error: err.message || (stderr ? stderr.trim() : 'Failed to query model quota')
+          });
+        }
+
+        const rawOutput = (stdout || '').trim();
+        try {
+          const parsed = JSON.parse(rawOutput);
+          if (parsed.command?.name === 'usage' && parsed.command?.data?.groups) {
+            return resolve({
+              success: true,
+              data: parsed.command.data,
+              rawText: parsed.response
+            });
+          }
+
+          if (parsed.response && typeof parsed.response === 'string') {
+            const parsedData = parseTabSeparatedQuota(parsed.response);
+            if (parsedData.groups.length > 0) {
+              return resolve({
+                success: true,
+                data: parsedData,
+                rawText: parsed.response
+              });
+            }
+          }
+
+          return resolve({
+            success: true,
+            rawText: parsed.response || rawOutput
+          });
+        } catch {
+          const parsedData = parseTabSeparatedQuota(rawOutput);
+          if (parsedData.groups.length > 0) {
+            return resolve({
+              success: true,
+              data: parsedData,
+              rawText: rawOutput
+            });
+          }
+
+          return resolve({
+            success: true,
+            rawText: rawOutput || (stderr ? stderr.trim() : 'No quota information returned')
           });
         }
       }
@@ -449,6 +699,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         `🖥️ **Antigravity Mainframe Bridge**\n\n` +
         `**Commands:**\n` +
         `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains context in thread)\n` +
+        `• \`${prefix} quota\` (or \`model-quota\`) — View model quota, limits, and reset times\n` +
         `• \`${prefix} new\` or \`${prefix} reset\` — Start a fresh conversation\n` +
         `• \`${prefix} status\` — View active session info and bridge status\n` +
         `• \`${prefix} help\` — Show this help message\n\n` +
@@ -465,7 +716,8 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         `• **Active Conversation ID:** \`${activeId}\`\n` +
         `• **AGY Binary:** \`${agyBin}\`\n` +
         `• **Operator:** <@${message.author.id}>\n` +
-        `• **Bot Status:** Connected & Ready`
+        `• **Bot Status:** Connected & Ready\n` +
+        `• **Tip:** Run \`${prefix} quota\` to view current model limits and reset times.`
       );
       return;
     }
@@ -473,6 +725,58 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
     if (lowerPrompt === 'new' || lowerPrompt === 'reset') {
       sessionMap.delete(targetChannel.id);
       await (targetChannel as any).send('🔄 **Session Reset**: Next message will begin a brand-new conversation session with AGY.');
+      return;
+    }
+
+    if (isModelQuotaCommand(prompt)) {
+      try {
+        await message.react('📊').catch(() => {});
+        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
+          await (targetChannel as any).sendTyping().catch(() => {});
+        }
+
+        const isRaw = /(--json|-j|--raw|-r)\b/i.test(prompt);
+        const quotaResult = await fetchModelQuota(agyBin);
+
+        if (!quotaResult.success) {
+          await message.reactions.removeAll().catch(() => {});
+          await message.react('❌').catch(() => {});
+          const safeErr = redactSecrets(quotaResult.error || 'Failed to query model quota', config);
+          await (targetChannel as any).send(`❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);
+          return;
+        }
+
+        await message.reactions.removeAll().catch(() => {});
+        await message.react('✅').catch(() => {});
+
+        if (isRaw) {
+          const payload = quotaResult.data ? JSON.stringify(quotaResult.data, null, 2) : (quotaResult.rawText || '{}');
+          const chunks = splitDiscordMessage(`### 📊 Model Quota (Raw Data)\n\`\`\`json\n${payload}\n\`\`\``);
+          for (const chunk of chunks) {
+            await (targetChannel as any).send(chunk);
+          }
+          return;
+        }
+
+        let messageToSend = '';
+        if (quotaResult.data && quotaResult.data.groups && quotaResult.data.groups.length > 0) {
+          messageToSend = formatQuotaForDiscord(quotaResult.data);
+        } else if (quotaResult.rawText) {
+          messageToSend = formatForDiscord(quotaResult.rawText, config);
+        } else {
+          messageToSend = '• **Model Quota:** No quota information available.';
+        }
+
+        const chunks = splitDiscordMessage(messageToSend);
+        for (const chunk of chunks) {
+          await (targetChannel as any).send(chunk);
+        }
+      } catch (quotaErr: any) {
+        await message.reactions.removeAll().catch(() => {});
+        await message.react('❌').catch(() => {});
+        const safeErr = redactSecrets(quotaErr.message || String(quotaErr), config);
+        await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
+      }
       return;
     }
 
@@ -599,6 +903,47 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       } catch {}
       const safeErr = redactSecrets(err.message || String(err), config);
       await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
+    }
+  });
+
+  // Handle Slash Command interactions (e.g. /quota, /model-quota)
+  client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'quota' || interaction.commandName === 'model-quota') {
+      if (interaction.guildId && config.allowedGuildIds.length > 0 && !config.allowedGuildIds.includes(interaction.guildId)) {
+        await interaction.reply({ content: '⛔ This server is not authorized for Hyposea Mainframe commands.', ephemeral: true });
+        return;
+      }
+
+      if (!authorizedUsers.has(interaction.user.id)) {
+        await interaction.reply({ content: '⛔ **Access Denied**: You are not authorized to query the AGY Mainframe.', ephemeral: true });
+        return;
+      }
+
+      await interaction.deferReply();
+      try {
+        const quotaResult = await fetchModelQuota(agyBin);
+        if (!quotaResult.success) {
+          const safeErr = redactSecrets(quotaResult.error || 'Failed to query quota', config);
+          await interaction.editReply(`❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);
+          return;
+        }
+
+        let messageToSend = '';
+        if (quotaResult.data && quotaResult.data.groups && quotaResult.data.groups.length > 0) {
+          messageToSend = formatQuotaForDiscord(quotaResult.data);
+        } else if (quotaResult.rawText) {
+          messageToSend = formatForDiscord(quotaResult.rawText, config);
+        } else {
+          messageToSend = '• **Model Quota:** No quota information available.';
+        }
+
+        await interaction.editReply(messageToSend);
+      } catch (err: any) {
+        const safeErr = redactSecrets(err.message || String(err), config);
+        await interaction.editReply(`❌ **Error fetching quota**: ${safeErr}`);
+      }
     }
   });
 }
