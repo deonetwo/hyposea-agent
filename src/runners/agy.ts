@@ -58,6 +58,7 @@ export class AgyRunner implements AgentRunner {
   private defaultCwd: string;
   private dangerouslySkipPermissions: boolean;
   private timeoutMs: number;
+  private hasNotifiedAuthError = false;
 
   constructor(options: AgyRunnerOptions = {}) {
     this.binPath = options.binPath || process.env.AGY_BIN_PATH || '/home/ubuntu/.local/bin/agy';
@@ -188,13 +189,29 @@ export class AgyRunner implements AgentRunner {
             rawErr.toLowerCase().includes('unauthorized') ||
             rawErr.toLowerCase().includes('authenticated');
 
+          if (isAuthError) {
+            if (!this.hasNotifiedAuthError) {
+              this.hasNotifiedAuthError = true;
+              return resolve({
+                response: '',
+                error: 'AGY needs re-login on the server'
+              });
+            } else {
+              return resolve({
+                response: '',
+                error: 'AGY authentication expired (notification already sent)'
+              });
+            }
+          }
+
           return resolve({
             response: '',
-            error: isAuthError
-              ? 'AGY authentication failed or expired. Please re-login on the server.'
-              : rawErr || `AGY exited with code ${code}`
+            error: rawErr || `AGY exited with code ${code}`
           });
         }
+
+        // On successful exit, reset auth error notification state
+        this.hasNotifiedAuthError = false;
 
         try {
           const parsed = JSON.parse(rawOutput);
