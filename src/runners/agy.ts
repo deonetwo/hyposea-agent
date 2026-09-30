@@ -215,8 +215,19 @@ export class AgyRunner implements AgentRunner {
 
         try {
           const parsed = JSON.parse(rawOutput);
+          let responseText = parsed.response || '';
+
+          if (!responseText && parsed.denied_actions && parsed.denied_actions.length > 0) {
+            const deniedNames = parsed.denied_actions
+              .map((a: any) => a.display_name || a.action)
+              .join(', ');
+            responseText = `⚠️ **Permission Required by AGY**: The action(s) \`${deniedNames}\` were blocked because permission confirmation is required.\n\nTo allow the bot to execute tools headlessly, set \`skipPermissions: true\` in \`~/.hyposea/config.yaml\` and restart the service.`;
+          } else if (!responseText && parsed.status === 'SUCCESS') {
+            responseText = '(AGY completed with no output)';
+          }
+
           return resolve({
-            response: parsed.response || rawOutput,
+            response: responseText || rawOutput,
             conversationId: parsed.conversation_id,
             durationSeconds: parsed.duration_seconds,
             tokensUsed: parsed.usage?.total_tokens
