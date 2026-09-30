@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import path from 'node:path';
 
 dotenv.config();
 
@@ -10,7 +11,9 @@ export interface AppConfig {
   mainframePrefix: string;
   agyBinPath: string;
   allowedGuildIds: string[];
-  authToken?: string;
+  workDir: string;
+  dbPath: string;
+  skipPermissions: boolean;
 }
 
 export function loadConfig(): AppConfig {
@@ -23,7 +26,10 @@ export function loadConfig(): AppConfig {
   const mainframeAuthorizedUsers = rawUsers.split(',').map(s => s.trim()).filter(Boolean);
   const rawGuilds = process.env.ALLOWED_GUILD_IDS || process.env.DISCORD_GUILD_ID || '';
   const allowedGuildIds = rawGuilds.split(',').map(s => s.trim()).filter(Boolean);
-  const authToken = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
+  
+  const workDir = process.env.HYPOSEA_WORKDIR?.trim() || process.cwd();
+  const dbPath = process.env.HYPOSEA_DB_PATH?.trim() || path.resolve(process.cwd(), 'data', 'hyposea.db');
+  const skipPermissions = process.env.AGY_SKIP_PERMISSIONS === 'true';
 
   return {
     discordToken,
@@ -33,7 +39,9 @@ export function loadConfig(): AppConfig {
     mainframePrefix,
     agyBinPath,
     allowedGuildIds,
-    authToken
+    workDir,
+    dbPath,
+    skipPermissions
   };
 }
 

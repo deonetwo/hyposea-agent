@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -9,44 +8,37 @@ import {
   TextBasedChannel
 } from 'discord.js';
 import { AppConfig } from './config.js';
+import { SessionStore } from './core/session-store.js';
+import { PerKeyQueue } from './core/queue.js';
+import { AgyRunner, getSanitizedEnvironment, parseTabSeparatedQuota } from './runners/agy.js';
+import {
+  ModelQuotaData,
+  ModelQuotaResult,
+  RunResult as AgyRunResult
+} from './core/types.js';
 
-export interface AgyRunResult {
-  response: string;
-  conversationId?: string;
-  durationSeconds?: number;
-  tokensUsed?: number;
-  error?: string;
+export {
+  getSanitizedEnvironment,
+  parseTabSeparatedQuota,
+  AgyRunResult,
+  ModelQuotaData,
+  ModelQuotaResult
+};
+
+// Singleton session store and execution queue
+let sessionStore: SessionStore | null = null;
+const queue = new PerKeyQueue();
+
+export function getSessionStore(dbPath?: string): SessionStore {
+  if (!sessionStore) {
+    sessionStore = new SessionStore({ dbPath });
+  }
+  return sessionStore;
 }
 
-export interface QuotaBucket {
-  id: string;
-  name: string;
-  description?: string;
-  window?: string;
-  remaining_fraction: number;
-  reset_time?: string;
+export function getQueue(): PerKeyQueue {
+  return queue;
 }
-
-export interface QuotaGroup {
-  name: string;
-  description?: string;
-  buckets: QuotaBucket[];
-}
-
-export interface ModelQuotaData {
-  description?: string;
-  groups: QuotaGroup[];
-}
-
-export interface ModelQuotaResult {
-  success: boolean;
-  data?: ModelQuotaData;
-  rawText?: string;
-  error?: string;
-}
-
-// Stores conversationId per channel/thread to maintain conversation history
-const sessionMap = new Map<string, string>();
 
 /**
  * Splits long responses into chunks within Discord's 2000 character limit
@@ -88,9 +80,13 @@ export function splitDiscordMessage(text: string, maxLength = 1900): string[] {
           currentChunk = line;
         }
       } else {
-        // Line itself exceeds maxLength, split hard
-        chunks.push(line.slice(0, maxLength));
-        currentChunk = line.slice(maxLength);
+        // Line itself exceeds maxLength, split cleanly in a loop
+        let remaining = line;
+        while (remaining.length > maxLength) {
+          chunks.push(remaining.slice(0, maxLength));
+          remaining = remaining.slice(maxLength);
+        }
+        currentChunk = remaining;
       }
     } else {
       currentChunk = currentChunk.length === 0 ? line : currentChunk + '\n' + line;
@@ -157,7 +153,7 @@ export function convertMarkdownTablesToBullets(text: string): string {
         }
       }
 
-      // We are in the table body rows
+      // In table body rows
       if (headers.length > 0) {
         if (headers.length === 2) {
           result.push(`• **${cells[0]}:** ${cells[1] || ''}`);
@@ -184,11 +180,11 @@ export function convertMarkdownTablesToBullets(text: string): string {
 /**
  * Redacts secrets, tokens, and credentials from text before outputting to Discord.
  */
-export function redactSecrets(text: string, config?: AppConfig): string {
+export function redactSecrets(text: string, config?: Partial<AppConfig> & { authToken?: string }): string {
   if (!text) return '';
   let cleaned = text;
 
-  // 1. Redact configured application secrets if provided (or from env fallback)
+  // 1. Redact configured application secrets if provided
   const botToken = config?.discordToken || process.env.DISCORD_BOT_TOKEN;
   if (botToken && botToken.length > 5) {
     cleaned = cleaned.replaceAll(botToken, '[REDACTED_BOT_TOKEN]');
@@ -198,11 +194,11 @@ export function redactSecrets(text: string, config?: AppConfig): string {
     cleaned = cleaned.replaceAll(mcpToken, '[REDACTED_MCP_TOKEN]');
   }
 
-  // 2. Redact Discord Bot Token format (e.g. MTU0...bqDY or MFA token)
+  // 2. Redact Discord Bot Token format
   cleaned = cleaned.replace(/\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}\b/g, '[REDACTED_DISCORD_TOKEN]');
   cleaned = cleaned.replace(/\bmfa\.[A-Za-z0-9_-]{80,100}\b/g, '[REDACTED_MFA_TOKEN]');
 
-  // 3. Redact GitHub Personal Access Tokens (classic ghp_ and fine-grained github_pat_)
+  // 3. Redact GitHub Personal Access Tokens
   cleaned = cleaned.replace(/\bgithub_pat_[A-Za-z0-9_]{50,}\b/g, '[REDACTED_GITHUB_PAT]');
   cleaned = cleaned.replace(/\bghp_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
   cleaned = cleaned.replace(/\bgh[ousr]_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
@@ -220,7 +216,7 @@ export function redactSecrets(text: string, config?: AppConfig): string {
 /**
  * Filter and format raw output for clean, polished Discord display.
  */
-export function formatForDiscord(raw: string, config?: AppConfig): string {
+export function formatForDiscord(raw: string, config?: Partial<AppConfig> & { authToken?: string }): string {
   if (!raw) return '';
 
   let text = raw;
@@ -228,14 +224,15 @@ export function formatForDiscord(raw: string, config?: AppConfig): string {
   // 1. Redact secrets, tokens, and credentials
   text = redactSecrets(text, config);
 
-  // 2. Strip ANSI escape sequences (terminal colors, cursor movements)
+  // 2. Strip ANSI escape sequences
   text = text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
-  // 3. Strip internal system / reasoning tags
+  // 3. Strip internal system / reasoning tags (fixing any <s> or <system> tags)
   text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
   text = text.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
   text = text.replace(/<context>[\s\S]*?<\/context>/gi, '');
   text = text.replace(/<system>[\s\S]*?<\/system>/gi, '');
+  text = text.replace(/<s>[\s\S]*?<\/s>/gi, '');
 
   // 4. Prevent accidental mass mentions
   text = text.replace(/@(everyone|here)/g, '@\u200b$1');
@@ -269,48 +266,7 @@ export function hasExplicitConfirmationFlag(prompt: string): boolean {
 }
 
 /**
- * Generates a sanitized environment object for child process execution,
- * stripping sensitive tokens, credentials, and API keys.
- */
-export function getSanitizedEnvironment(): NodeJS.ProcessEnv {
-  const SENSITIVE_KEYS = new Set([
-    'DISCORD_BOT_TOKEN',
-    'MCP_AUTH_TOKEN',
-    'GITHUB_PAT',
-    'GH_TOKEN',
-    'GITHUB_TOKEN',
-    'AWS_ACCESS_KEY_ID',
-    'AWS_SECRET_ACCESS_KEY',
-    'AWS_SESSION_TOKEN',
-    'OPENAI_API_KEY',
-    'ANTHROPIC_API_KEY',
-    'GEMINI_API_KEY'
-  ]);
-
-  const sanitized: NodeJS.ProcessEnv = {};
-  for (const [key, val] of Object.entries(process.env)) {
-    if (val === undefined) continue;
-    const lowerKey = key.toLowerCase();
-    // Omit sensitive keys or variables containing token/secret/password/auth
-    if (
-      SENSITIVE_KEYS.has(key) ||
-      lowerKey.includes('token') ||
-      lowerKey.includes('secret') ||
-      lowerKey.includes('password') ||
-      lowerKey.includes('auth')
-    ) {
-      continue;
-    }
-    sanitized[key] = val;
-  }
-
-  sanitized['PAGER'] = 'cat';
-  sanitized['TERM'] = 'xterm-256color';
-  return sanitized;
-}
-
-/**
- * Executes a prompt against the AGY CLI non-interactively in json mode
+ * Executes a prompt against AGY (backward-compatible delegate to AgyRunner)
  */
 export async function runAgyCommand(
   prompt: string,
@@ -318,62 +274,16 @@ export async function runAgyCommand(
   agyBin = '/home/ubuntu/.local/bin/agy',
   cwd = process.cwd()
 ): Promise<AgyRunResult> {
-  return new Promise((resolve) => {
-    const args = [
-      '--dangerously-skip-permissions',
-      '--add-dir',
-      cwd,
-      '--output-format',
-      'json'
-    ];
+  const runner = new AgyRunner({
+    binPath: agyBin,
+    defaultCwd: cwd,
+    dangerouslySkipPermissions: true
+  });
 
-    if (conversationId) {
-      args.push('--conversation', conversationId);
-    }
-
-    // Explicitly enforce discord-display skill guidelines for Discord active sessions
-    const sessionPrompt = conversationId
-      ? prompt
-      : `[Context: Active Discord session in #mainframe-channel. Strictly adhere to discord-display skill guidelines: use ### headers, emoji bullets, no markdown tables, concise direct tone]\n\n${prompt}`;
-
-    args.push('-p', sessionPrompt);
-
-    execFile(
-      agyBin,
-      args,
-      {
-        cwd,
-        timeout: 300000, // 5 min timeout
-        maxBuffer: 15 * 1024 * 1024,
-        env: getSanitizedEnvironment()
-      },
-      (err, stdout, stderr) => {
-        if (err && !stdout) {
-          return resolve({
-            response: '',
-            error: err.message || (stderr ? stderr.trim() : 'Unknown AGY execution error')
-          });
-        }
-
-        const rawOutput = (stdout || '').trim();
-        try {
-          // Attempt to parse JSON response from agy
-          const parsed = JSON.parse(rawOutput);
-          return resolve({
-            response: parsed.response || rawOutput,
-            conversationId: parsed.conversation_id,
-            durationSeconds: parsed.duration_seconds,
-            tokensUsed: parsed.usage?.total_tokens
-          });
-        } catch {
-          // Fallback if stdout contains raw non-JSON text
-          return resolve({
-            response: rawOutput || (stderr ? stderr.trim() : '(Empty response)'),
-            conversationId
-          });
-        }
-      }
-    );
+  return runner.run({
+    prompt,
+    sessionId: conversationId,
+    cwd
   });
 }
 
@@ -396,46 +306,6 @@ export function getQuotaStatusEmoji(fraction: number): string {
   if (fraction >= 0.5) return '🟢';
   if (fraction >= 0.2) return '🟡';
   return '🔴';
-}
-
-/**
- * Parses tab-separated or aligned space table output from agy -p "/quota"
- */
-export function parseTabSeparatedQuota(text: string): ModelQuotaData {
-  const groupsMap = new Map<string, QuotaBucket[]>();
-  const lines = text.split('\n');
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.toLowerCase().startsWith('quota:')) continue;
-    const parts = trimmed.split(/\t+|\s{2,}/);
-    if (parts.length >= 3) {
-      const groupName = parts[0].trim();
-      const bucketName = parts[1].trim();
-      const pctMatch = parts[2].match(/(\d+)%/);
-      const remaining_fraction = pctMatch ? parseInt(pctMatch[1], 10) / 100 : 1;
-      const reset_time = parts[3] ? parts[3].trim() : undefined;
-
-      const bucket: QuotaBucket = {
-        id: bucketName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-        name: bucketName,
-        remaining_fraction,
-        reset_time
-      };
-
-      if (!groupsMap.has(groupName)) {
-        groupsMap.set(groupName, []);
-      }
-      groupsMap.get(groupName)!.push(bucket);
-    }
-  }
-
-  const groups: QuotaGroup[] = Array.from(groupsMap.entries()).map(([name, buckets]) => ({
-    name,
-    buckets
-  }));
-
-  return { groups };
 }
 
 /**
@@ -526,78 +396,12 @@ export async function fetchModelQuota(
   agyBin = '/home/ubuntu/.local/bin/agy',
   cwd = process.cwd()
 ): Promise<ModelQuotaResult> {
-  return new Promise((resolve) => {
-    const args = [
-      '--dangerously-skip-permissions',
-      '--add-dir',
-      cwd,
-      '--output-format',
-      'json',
-      '-p',
-      '/quota'
-    ];
-
-    execFile(
-      agyBin,
-      args,
-      {
-        cwd,
-        timeout: 45000,
-        maxBuffer: 10 * 1024 * 1024,
-        env: getSanitizedEnvironment()
-      },
-      (err, stdout, stderr) => {
-        if (err && !stdout) {
-          return resolve({
-            success: false,
-            error: err.message || (stderr ? stderr.trim() : 'Failed to query model quota')
-          });
-        }
-
-        const rawOutput = (stdout || '').trim();
-        try {
-          const parsed = JSON.parse(rawOutput);
-          if (parsed.command?.name === 'usage' && parsed.command?.data?.groups) {
-            return resolve({
-              success: true,
-              data: parsed.command.data,
-              rawText: parsed.response
-            });
-          }
-
-          if (parsed.response && typeof parsed.response === 'string') {
-            const parsedData = parseTabSeparatedQuota(parsed.response);
-            if (parsedData.groups.length > 0) {
-              return resolve({
-                success: true,
-                data: parsedData,
-                rawText: parsed.response
-              });
-            }
-          }
-
-          return resolve({
-            success: true,
-            rawText: parsed.response || rawOutput
-          });
-        } catch {
-          const parsedData = parseTabSeparatedQuota(rawOutput);
-          if (parsedData.groups.length > 0) {
-            return resolve({
-              success: true,
-              data: parsedData,
-              rawText: rawOutput
-            });
-          }
-
-          return resolve({
-            success: true,
-            rawText: rawOutput || (stderr ? stderr.trim() : 'No quota information returned')
-          });
-        }
-      }
-    );
+  const runner = new AgyRunner({
+    binPath: agyBin,
+    defaultCwd: cwd,
+    dangerouslySkipPermissions: true
   });
+  return runner.fetchQuota(cwd);
 }
 
 /**
@@ -609,18 +413,23 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
     return;
   }
 
+  const store = getSessionStore(config.dbPath);
   const targetChannelName = (config.mainframeChannel || 'mainframe-channel').toLowerCase();
   const prefix = (config.mainframePrefix || '!agy').toLowerCase();
   const authorizedUsers = new Set(config.mainframeAuthorizedUsers || []);
-  const agyBin = config.agyBinPath || '/home/ubuntu/.local/bin/agy';
+  const agyRunner = new AgyRunner({
+    binPath: config.agyBinPath,
+    defaultCwd: config.workDir,
+    dangerouslySkipPermissions: config.skipPermissions
+  });
 
-  console.error(`[Mainframe] Bridge initialized. Listening on #${targetChannelName} for prefix "${prefix}" or @mentions.`);
+  console.error(`[Mainframe] Bridge initialized. Listening on #${targetChannelName} (Prefix: "${prefix}" or @mentions). Working dir: ${config.workDir}`);
 
   client.on('messageCreate', async (message: Message) => {
-    // 1. Ignore bot messages to prevent infinite loops
+    // 1. Ignore bot messages
     if (message.author.bot) return;
 
-    // 2. Validate guild boundaries if guild ID is present
+    // 2. Validate guild boundaries
     if (message.guildId && config.allowedGuildIds.length > 0 && !config.allowedGuildIds.includes(message.guildId)) {
       return;
     }
@@ -637,10 +446,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
     const content = message.content.trim();
     if (!content) return;
 
-    // 4. Determine trigger condition:
-    // - Prefix match (e.g. "!agy ...")
-    // - Mention match (e.g. "@Hyposea Agent ...")
-    // - In thread under mainframe: all messages from authorized users trigger
+    // 4. Determine trigger condition
     const botMention = `<@${client.user?.id}>`;
     const botNicknameMention = `<@!${client.user?.id}>`;
 
@@ -663,68 +469,68 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
 
     if (!isTriggered) return;
 
-    // 5. Check Authorization: restrict strictly to authorized user
+    // 5. Check Authorization
     if (!authorizedUsers.has(message.author.id)) {
       await message.reply('⛔ **Access Denied**: You are not authorized to issue commands to the AGY Mainframe.');
       return;
     }
 
-    // 6. Ensure Execution Occurs in a Thread if called in #mainframe-channel
-    let targetChannel: TextBasedChannel = message.channel;
-    if (!message.channel.isThread()) {
-      try {
-        if (message.hasThread && message.thread) {
-          targetChannel = message.thread;
-        } else if ('startThread' in message && typeof message.startThread === 'function') {
-          const promptSummary = prompt.replace(/[\r\n]+/g, ' ').trim();
-          const cleanName = promptSummary.length > 50
-            ? `${promptSummary.slice(0, 47)}...`
-            : (promptSummary || 'AGY Session');
-          targetChannel = await message.startThread({
-            name: `🤖 ${cleanName}`,
-            autoArchiveDuration: 60
-          });
-        }
-      } catch (threadErr: any) {
-        console.error('[Mainframe] Thread creation failed, falling back to message channel:', threadErr.message);
-        targetChannel = message.channel;
+    // Session Key:
+    // If inside a thread: session key is the thread ID.
+    // If in the direct mainframe channel: session key is 'main-session' (sticky persistent session).
+    const sessionKey = channel.isThread() ? channel.id : `main-${channel.id}`;
+    const targetChannel: TextBasedChannel = message.channel;
+    const lowerPrompt = prompt.toLowerCase();
+
+    // 6. Handle 'stop' Command
+    if (lowerPrompt === 'stop' || lowerPrompt === 'abort' || lowerPrompt === 'cancel') {
+      if (queue.isBusy(sessionKey)) {
+        queue.abort(sessionKey);
+        await message.react('🛑').catch(() => {});
+        await (targetChannel as any).send('🛑 **Execution Aborted**: The active AGY process for this session has been cancelled. (Session context preserved).');
+      } else {
+        await (targetChannel as any).send('ℹ️ No active AGY execution is currently running in this session.');
       }
+      return;
     }
 
     // 7. Handle Special Helper Commands
-    const lowerPrompt = prompt.toLowerCase();
-
     if (lowerPrompt === 'help' || lowerPrompt === '--help') {
       await (targetChannel as any).send(
         `🖥️ **Antigravity Mainframe Bridge**\n\n` +
         `**Commands:**\n` +
-        `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains context in thread)\n` +
-        `• \`${prefix} quota\` (or \`model-quota\`) — View model quota, limits, and reset times\n` +
-        `• \`${prefix} new\` or \`${prefix} reset\` — Start a fresh conversation\n` +
+        `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains continuous context)\n` +
+        `• \`${prefix} quota\` — View model quota, limits, and reset times\n` +
+        `• \`${prefix} stop\` — Cancel the running AGY command in this session\n` +
+        `• \`${prefix} reset\` (or \`new\`) — Start a fresh conversation\n` +
         `• \`${prefix} status\` — View active session info and bridge status\n` +
         `• \`${prefix} help\` — Show this help message\n\n` +
-        `*You can also tag <@${client.user?.id}> or create threads under #${targetChannelName} for isolated conversations.*`
+        `*Tip: Conversations persist across bot restarts in SQLite. Create a thread for isolated scratchpads.*`
       );
       return;
     }
 
     if (lowerPrompt === 'status') {
-      const activeId = sessionMap.get(targetChannel.id) || '(No active session)';
+      const session = store.get(sessionKey);
+      const activeId = session?.conversationId || '(No active conversation yet)';
+      const msgCount = session?.messageCount || 0;
       await (targetChannel as any).send(
         `🖥️ **Mainframe Status:**\n` +
         `• **Target Channel:** #${targetChannelName}\n` +
+        `• **Session Mode:** ${channel.isThread() ? '🧵 Thread Session' : '📌 Primary Persistent Session'}\n` +
         `• **Active Conversation ID:** \`${activeId}\`\n` +
-        `• **AGY Binary:** \`${agyBin}\`\n` +
+        `• **Messages in Session:** ${msgCount}\n` +
+        `• **Working Directory:** \`${config.workDir}\`\n` +
+        `• **AGY Binary:** \`${config.agyBinPath}\`\n` +
         `• **Operator:** <@${message.author.id}>\n` +
-        `• **Bot Status:** Connected & Ready\n` +
-        `• **Tip:** Run \`${prefix} quota\` to view current model limits and reset times.`
+        `• **Queue Busy:** ${queue.isBusy(sessionKey) ? '⏳ Yes' : '🟢 Idle'}`
       );
       return;
     }
 
     if (lowerPrompt === 'new' || lowerPrompt === 'reset') {
-      sessionMap.delete(targetChannel.id);
-      await (targetChannel as any).send('🔄 **Session Reset**: Next message will begin a brand-new conversation session with AGY.');
+      store.delete(sessionKey);
+      await (targetChannel as any).send('🔄 **Session Reset**: Your next message will begin a brand-new conversation session with AGY.');
       return;
     }
 
@@ -736,7 +542,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         }
 
         const isRaw = /(--json|-j|--raw|-r)\b/i.test(prompt);
-        const quotaResult = await fetchModelQuota(agyBin);
+        const quotaResult = await agyRunner.fetchQuota(config.workDir);
 
         if (!quotaResult.success) {
           await message.reactions.removeAll().catch(() => {});
@@ -785,7 +591,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       return;
     }
 
-    // 8. Check for Deletion / Destructive Intent & Require Confirmation
+    // 8. Check Deletion / Destructive Intent & Confirmation
     if (isDeletionIntent(prompt) && !hasExplicitConfirmationFlag(prompt)) {
       const confirmButton = new ButtonBuilder()
         .setCustomId('confirm_deletion')
@@ -800,8 +606,8 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         .setEmoji('✖️');
 
       const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmButton, cancelButton);
-
       const promptPreview = prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt;
+
       const confirmMsg = await (targetChannel as any).send({
         content:
           `⚠️ **Deletion Confirmation Required**\n` +
@@ -826,13 +632,11 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
           return;
         }
 
-        // Confirmed!
         await interaction.update({
           content: `🗑️ **Deletion Confirmed** by <@${message.author.id}>. Dispatching to AGY...`,
           components: []
         });
       } catch {
-        // Timed out after 60s
         await confirmMsg.edit({
           content: `⏳ **Operation Cancelled**: Deletion confirmation timed out after 60 seconds.`,
           components: []
@@ -841,72 +645,80 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
       }
     }
 
-    // 9. Execute AGY Prompt in target thread / channel
-    const sessionKey = targetChannel.id;
-    const currentConvId = sessionMap.get(sessionKey);
+    // 9. Execute AGY Prompt via FIFO Queue for this session
+    await message.react('⚙️').catch(() => {});
 
-    // Add working reaction indicator to original message
-    try {
-      await message.react('⚙️');
-    } catch {
-      // Non-fatal if reaction fails
-    }
+    await queue.enqueue(sessionKey, async (signal: AbortSignal) => {
+      const currentConvId = store.getConversationId(sessionKey) || undefined;
 
-    // Send typing indicators periodically in targetChannel while AGY thinks and executes
-    const typingInterval = setInterval(() => {
-      if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
-        (targetChannel as any).sendTyping().catch(() => {});
-      }
-    }, 7000);
-
-    try {
-      if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
-        await (targetChannel as any).sendTyping();
-      }
-
-      const result = await runAgyCommand(prompt, currentConvId, agyBin);
-
-      clearInterval(typingInterval);
-
-      if (result.error) {
-        try {
-          await message.reactions.removeAll();
-          await message.react('❌');
-        } catch {}
-        const safeError = redactSecrets(result.error, config);
-        await (targetChannel as any).send(`❌ **AGY Execution Error**:\n\`\`\`text\n${safeError}\n\`\`\``);
-        return;
-      }
-
-      // Update session conversation ID for context continuity
-      if (result.conversationId) {
-        sessionMap.set(sessionKey, result.conversationId);
-      }
+      // Periodic typing indicator while running
+      const typingInterval = setInterval(() => {
+        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
+          (targetChannel as any).sendTyping().catch(() => {});
+        }
+      }, 7000);
 
       try {
-        await message.reactions.removeAll();
-        await message.react('✅');
-      } catch {}
+        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
+          await (targetChannel as any).sendTyping().catch(() => {});
+        }
 
-      // Format output cleanly for Discord, redact secrets, and split into safe chunks
-      const formatted = formatForDiscord(result.response || '(Done with no output)', config);
-      const chunks = splitDiscordMessage(formatted, 1900);
+        const sessionPrompt = currentConvId
+          ? prompt
+          : `[Context: Active Discord session in #${targetChannelName}. Strictly adhere to discord-display skill guidelines: use ### headers, emoji bullets, no markdown tables, concise direct tone]\n\n${prompt}`;
 
-      for (const chunk of chunks) {
-        await (targetChannel as any).send(chunk);
+        const result = await agyRunner.run({
+          prompt: sessionPrompt,
+          sessionId: currentConvId,
+          cwd: config.workDir,
+          signal
+        });
+
+        clearInterval(typingInterval);
+
+        if (result.aborted) {
+          await message.reactions.removeAll().catch(() => {});
+          await message.react('🛑').catch(() => {});
+          return;
+        }
+
+        if (result.error) {
+          await message.reactions.removeAll().catch(() => {});
+          await message.react('❌').catch(() => {});
+          const safeError = redactSecrets(result.error, config);
+          await (targetChannel as any).send(`❌ **AGY Execution Error**:\n\`\`\`text\n${safeError}\n\`\`\``);
+          return;
+        }
+
+        // Save conversation ID to SQLite
+        if (result.conversationId) {
+          store.set(sessionKey, result.conversationId, {
+            channelId: channel.id,
+            isThread: channel.isThread(),
+            authorId: message.author.id
+          });
+        }
+
+        await message.reactions.removeAll().catch(() => {});
+        await message.react('✅').catch(() => {});
+
+        const formatted = formatForDiscord(result.response || '(Done with no output)', config);
+        const chunks = splitDiscordMessage(formatted, 1900);
+
+        for (const chunk of chunks) {
+          await (targetChannel as any).send(chunk);
+        }
+      } catch (err: any) {
+        clearInterval(typingInterval);
+        await message.reactions.removeAll().catch(() => {});
+        await message.react('❌').catch(() => {});
+        const safeErr = redactSecrets(err.message || String(err), config);
+        await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
       }
-    } catch (err: any) {
-      clearInterval(typingInterval);
-      try {
-        await message.reactions.removeAll();
-        await message.react('❌');
-      } catch {}
-      const safeErr = redactSecrets(err.message || String(err), config);
-      await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
-    }
+    });
   });
 
-  // Handle Slash Command interactions (e.g. /quota, /model-quota)
+  // Handle Slash Commands
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
@@ -923,7 +735,7 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
 
       await interaction.deferReply();
       try {
-        const quotaResult = await fetchModelQuota(agyBin);
+        const quotaResult = await agyRunner.fetchQuota(config.workDir);
         if (!quotaResult.success) {
           const safeErr = redactSecrets(quotaResult.error || 'Failed to query quota', config);
           await interaction.editReply(`❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);

@@ -25,3 +25,10 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Local databases & state
+data/
+*.db
+*.db-wal
+*.db-shm
+

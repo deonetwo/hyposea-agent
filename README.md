@@ -1,6 +1,6 @@
 # Hyposea Agent 🤖🌊
 
-**Hyposea Agent** is an interactive Discord bot that bridges Discord messages and threads directly to the **AGY (Google Antigravity)** CLI coding assistant.
+**Hyposea Agent** is an interactive Discord bot that bridges Discord messages and threads directly to the **AGY (Google Antigravity)** CLI assistant.
 
 It enables team members and autonomous workflows to issue prompts, execute tasks, and receive clean, formatted engineering output directly inside `#mainframe-channel` or dedicated discussion threads.
 
@@ -13,9 +13,12 @@ It enables team members and autonomous workflows to issue prompts, execute tasks
                      │
                      ▼
            [ Hyposea Agent Daemon ]
-                     │  (Command parsing, Auth whitelist, RCE/Secret guardrails)
+                     │  (Command parsing, Auth whitelist, Guardrails)
                      ▼
-           [ AGY CLI Subprocess ]  (e.g., ~/.local/bin/agy)
+         [ SQLite Session Store & Queue ] (Per-session serialization & persistence)
+                     │
+                     ▼
+           [ AGY CLI Subprocess ]  (src/runners/agy.ts)
                      │
                      ▼
            [ Output Formatter ]    (discord-display skill & Markdown chunking)
@@ -29,14 +32,15 @@ It enables team members and autonomous workflows to issue prompts, execute tasks
 ## ✨ Features
 
 - **Bidirectional Discord ↔ AGY Bridge**: Listens for `!agy` commands, bot @mentions, and replies within active threads.
-- **Session Continuity**: Preserves conversation history (`conversationId`) per thread/channel across multi-turn interactions.
+- **SQLite Session Persistence**: Preserves conversation history (`conversationId`) per thread/channel across bot restarts using SQLite WAL mode.
+- **Per-Session Execution Queue**: Enforces strict FIFO serialization so concurrent requests in the same session never collide.
+- **Process Tree Cancellation (`stop`)**: Cleanly cancels active running AGY subprocess trees via OS process groups when commanded, keeping the conversation session intact.
 - **Model Quota & Limits Command**: Instantly inspect model quota (Gemini, Claude, GPT), weekly/5-hour remaining capacity, and dynamic refresh timers via `!agy quota`.
 - **Security & Authorization Whitelist**:
-  - Restricts command execution to authorized Discord User IDs defined in `MAINFRAME_AUTHORIZED_USERS`.
-  - Blocks prompt injection, secret exposure, and unwhitelisted execution.
+  - Restricts command execution strictly to authorized Discord User IDs defined in `MAINFRAME_AUTHORIZED_USERS`.
   - Sanitizes subprocess environment variables, stripping sensitive system tokens from leaking to child processes.
   - Destructive action guardrails with interactive Discord confirmation buttons.
-- **Discord-Optimized Formatting**: Programmatic Markdown filtering following the `discord-display` skill (see `.agents/skills/discord-display/SKILL.md` and `AGENTS.md`). Converts complex tables into readable key-value bullets and splits large messages cleanly without breaking code blocks.
+- **Discord-Optimized Formatting**: Programmatic Markdown filtering following the `discord-display` skill (see [.agents/skills/discord-display/SKILL.md](.agents/skills/discord-display/SKILL.md) and [AGENTS.md](AGENTS.md)). Converts complex tables into readable key-value bullets and splits large messages cleanly without breaking code blocks.
 
 ---
 
@@ -45,13 +49,14 @@ It enables team members and autonomous workflows to issue prompts, execute tasks
 Inside `#mainframe-channel` (or in threads under it, or via @mention):
 
 • **`!agy <prompt>`** — Execute a prompt or coding task against AGY CLI (maintains session context in thread)  
+• **`!agy stop`** (or `stop`, `abort`) — Abort the currently running AGY task in this thread/session  
 • **`!agy quota`** (or `!agy model-quota`, `usage`) — View model quota status, visual progress bars, remaining percentage, and Discord countdown timers for limit resets  
 • **`!agy quota --json`** — Return raw JSON payload from AGY CLI quota endpoint  
 • **`!agy status`** — Inspect active bridge status, target channel, conversation ID, and operator ID  
-• **`!agy new`** / **`!agy reset`** — Clear current channel thread session and begin a fresh AGY conversation  
+• **`!agy reset`** / **`!agy new`** — Clear current channel thread session and begin a fresh AGY conversation  
 • **`!agy help`** — Show command list and usage tips  
 
-*Note: Inside any thread created under `#mainframe-channel`, authorized users can run `quota`, `status`, `help`, or prompts directly without the `!agy` prefix.*
+*Note: Inside any thread created under `#mainframe-channel`, authorized users can run `quota`, `stop`, `status`, `help`, or prompts directly without the `!agy` prefix.*
 
 ---
 
@@ -60,7 +65,7 @@ Inside `#mainframe-channel` (or in threads under it, or via @mention):
 ### Prerequisites
 
 - **Node.js**: v20 or higher
-- **Antigravity CLI (`agy`)**: Installed and authenticated on the host machine (e.g. `/home/ubuntu/.local/bin/agy`)
+- **Antigravity CLI (`agy`)**: Installed and authenticated on the host machine (e.g. `~/.local/bin/agy`)
 - **Discord Bot**: A registered Discord application bot with `Guilds`, `GuildMessages`, and `MessageContent` Gateway Intents enabled.
 
 ### 1. Installation
@@ -98,6 +103,12 @@ MAINFRAME_PREFIX=!agy
 
 # Absolute path to the AGY CLI executable
 AGY_BIN_PATH=/home/ubuntu/.local/bin/agy
+
+# Working directory for AGY commands (defaults to project directory)
+HYPOSEA_WORKDIR=
+
+# Optional SQLite database path (defaults to ./data/hyposea.db)
+HYPOSEA_DB_PATH=
 ```
 
 > [!IMPORTANT]
@@ -127,8 +138,8 @@ npm test
 ## 🎨 Discord Display Conventions
 
 All responses generated by Hyposea Agent follow the standards defined in:
-- [AGENTS.md](file:///home/ubuntu/moondust-project/hyposea-agent/AGENTS.md)
-- [.agents/skills/discord-display/SKILL.md](file:///home/ubuntu/moondust-project/hyposea-agent/.agents/skills/discord-display/SKILL.md)
+- [AGENTS.md](AGENTS.md)
+- [.agents/skills/discord-display/SKILL.md](.agents/skills/discord-display/SKILL.md)
 
 Key formatting rules:
 - **No giant headers**: Use `###` or bold text instead of `#` or `##`.
