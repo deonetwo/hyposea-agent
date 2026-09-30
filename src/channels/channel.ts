@@ -1,3 +1,11 @@
+export interface InboundAttachment {
+  id: string;
+  name: string;
+  url: string;
+  contentType?: string;
+  size: number;
+}
+
 export interface InboundMessage {
   id: string;
   channelId: string;
@@ -8,6 +16,7 @@ export interface InboundMessage {
   isDm: boolean;
   isThread: boolean;
   createdAt: number;
+  attachments?: InboundAttachment[];
   // Optional interaction hooks provided by the channel adapter
   react?: (emoji: string) => Promise<void>;
   clearReactions?: () => Promise<void>;
@@ -18,6 +27,7 @@ export interface InboundMessage {
 export interface OutboundMessage {
   content: string;
   replyToId?: string;
+  files?: string[];
 }
 
 export interface ChannelRef {

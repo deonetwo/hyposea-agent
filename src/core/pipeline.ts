@@ -7,6 +7,7 @@ import { AgentRunner } from '../runners/runner.js';
 import { AgyRunner } from '../runners/agy.js';
 import { AuditModule } from '../modules/audit/index.js';
 import { GuardModule } from '../modules/guard/index.js';
+import { AttachmentManager } from '../modules/attachments/index.js';
 import { ContextBuilder } from './context-builder.js';
 import {
   formatForDiscord,
@@ -23,6 +24,7 @@ export interface PipelineOptions {
   bus?: EventBus;
   audit?: AuditModule;
   guard?: GuardModule;
+  attachments?: AttachmentManager;
   contextBuilder?: ContextBuilder;
   config: AppConfig;
 }
@@ -35,6 +37,7 @@ export class Pipeline {
   private bus: EventBus;
   private audit: AuditModule;
   private guard: GuardModule;
+  private attachments: AttachmentManager;
   private contextBuilder: ContextBuilder;
   private config: AppConfig;
 
@@ -47,6 +50,7 @@ export class Pipeline {
     this.bus = options.bus || new EventBus();
     this.audit = options.audit || new AuditModule({ dbPath: this.config.dbPath });
     this.guard = options.guard || new GuardModule({ allowedDirectories: [this.config.workDir] });
+    this.attachments = options.attachments || new AttachmentManager({ workDir: this.config.workDir });
     this.contextBuilder = options.contextBuilder || new ContextBuilder();
 
     // Register audit listeners on the event bus
@@ -72,6 +76,10 @@ export class Pipeline {
 
   public getContextBuilder(): ContextBuilder {
     return this.contextBuilder;
+  }
+
+  public getAttachmentManager(): AttachmentManager {
+    return this.attachments;
   }
 
   public async start(): Promise<void> {
@@ -156,7 +164,7 @@ export class Pipeline {
       return;
     }
 
-    if (!prompt) {
+    if (!prompt && (!msg.attachments || msg.attachments.length === 0)) {
       await this.sendResponse(msg.channelId, `Please provide a prompt after \`${prefix}\`. Example: \`${prefix} what is the current git status?\``);
       return;
     }
@@ -190,16 +198,28 @@ export class Pipeline {
         if (msg.sendTyping) msg.sendTyping().catch(() => {});
       }, 7000);
 
+      let downloadedPaths: string[] = [];
+
       try {
         if (msg.sendTyping) await msg.sendTyping().catch(() => {});
 
+        // Download inbound attachments if provided
+        if (msg.attachments && msg.attachments.length > 0) {
+          downloadedPaths = await this.attachments.downloadAttachments(msg.attachments, msg.id);
+        }
+
+        // Enrich prompt with attachments if downloaded
+        const enrichedPrompt = downloadedPaths.length > 0
+          ? this.attachments.enrichPrompt(prompt || 'Please inspect the attached files.', downloadedPaths)
+          : prompt;
+
         // Build session prompt with memory context if starting a new session
         const sessionPrompt = currentConvId
-          ? prompt
-          : this.contextBuilder.buildInitialPrompt(prompt, this.config.mainframeChannel);
+          ? enrichedPrompt
+          : this.contextBuilder.buildInitialPrompt(enrichedPrompt, this.config.mainframeChannel);
 
         // Record user turn in FTS5
-        this.contextBuilder.recordTurn(sessionKey, 'user', prompt);
+        this.contextBuilder.recordTurn(sessionKey, 'user', prompt || '(attachment)');
 
         const result = await this.runner.run({
           prompt: sessionPrompt,
@@ -253,8 +273,10 @@ export class Pipeline {
         if (msg.clearReactions) await msg.clearReactions().catch(() => {});
         if (msg.react) await msg.react('✅').catch(() => {});
 
-        const formatted = formatForDiscord(result.response || '(Done with no output)', this.config);
-        await this.sendResponse(msg.channelId, formatted);
+        // Detect any outbound attachments requested by AGY
+        const outbound = this.attachments.detectOutboundAttachments(result.response || '(Done with no output)');
+        const formatted = formatForDiscord(outbound.cleanedResponse || '(Done with no output)', this.config);
+        await this.sendResponse(msg.channelId, formatted, outbound.files);
       } catch (err: any) {
         clearInterval(typingInterval);
         const durationMs = Date.now() - startTime;
@@ -264,6 +286,10 @@ export class Pipeline {
         if (msg.react) await msg.react('❌').catch(() => {});
         const safeErr = redactSecrets(err.message || String(err), this.config);
         await this.sendResponse(msg.channelId, `❌ **Unexpected Error**: ${safeErr}`);
+      } finally {
+        if (downloadedPaths.length > 0) {
+          this.attachments.cleanup(msg.id);
+        }
       }
     });
   }
@@ -287,8 +313,9 @@ export class Pipeline {
 
         if (result.response) {
           const header = `⏰ **Scheduled Task Result** [${job.jobId}]:\n`;
-          const formatted = formatForDiscord(result.response, this.config);
-          await this.sendResponse(job.target.channelId, `${header}${formatted}`);
+          const outbound = this.attachments.detectOutboundAttachments(result.response);
+          const formatted = formatForDiscord(outbound.cleanedResponse, this.config);
+          await this.sendResponse(job.target.channelId, `${header}${formatted}`, outbound.files);
         }
       } catch (err: any) {
         console.error(`[Pipeline] Failed to execute scheduled job ${job.jobId}:`, err.message);
@@ -373,10 +400,23 @@ export class Pipeline {
     return triggers.some((t) => clean === t || clean.startsWith(`${t} `));
   }
 
-  private async sendResponse(channelId: string, text: string): Promise<void> {
+  private async sendResponse(channelId: string, text: string, files?: string[]): Promise<void> {
     const chunks = splitDiscordMessage(text, 1900);
-    for (const chunk of chunks) {
-      await this.channel.send({ channelId }, { content: chunk });
+    if (chunks.length === 0) {
+      if (files && files.length > 0) {
+        await this.channel.send({ channelId }, { content: '', files });
+      }
+      return;
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
+      await this.channel.send(
+        { channelId },
+        {
+          content: chunks[i],
+          files: isLast && files && files.length > 0 ? files : undefined
+        }
+      );
     }
   }
 }

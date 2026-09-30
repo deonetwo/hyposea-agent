@@ -31,4 +31,5 @@ data/
 *.db
 *.db-wal
 *.db-shm
+.hyposea-attachments/
 

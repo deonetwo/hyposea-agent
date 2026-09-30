@@ -10,7 +10,7 @@ import {
   RateLimitData,
   TextBasedChannel
 } from 'discord.js';
-import { Channel, ChannelRef, InboundMessage, OutboundMessage } from '../channel.js';
+import { Channel, ChannelRef, InboundAttachment, InboundMessage, OutboundMessage } from '../channel.js';
 import { AppConfig } from '../../config.js';
 
 export interface DiscordChannelOptions {
@@ -83,6 +83,14 @@ export class DiscordChannel implements Channel {
     const isDm = message.channel.isDMBased() || !message.guildId;
     const authorId = message.author.id;
 
+    const rawAttachments: InboundAttachment[] = message.attachments.map((a) => ({
+      id: a.id,
+      name: a.name,
+      url: a.url,
+      contentType: a.contentType || undefined,
+      size: a.size
+    }));
+
     // 2. Strict Authorization for Direct Messages (Owner only)
     if (isDm) {
       if (!this.authorizedUsers.has(authorId)) {
@@ -107,6 +115,7 @@ export class DiscordChannel implements Channel {
         isDm: true,
         isThread: false,
         createdAt: message.createdTimestamp,
+        attachments: rawAttachments.length > 0 ? rawAttachments : undefined,
         react: async (emoji: string) => {
           await message.react(emoji).catch(() => {});
         },
@@ -180,6 +189,7 @@ export class DiscordChannel implements Channel {
       isDm: false,
       isThread: channel.isThread(),
       createdAt: message.createdTimestamp,
+      attachments: rawAttachments.length > 0 ? rawAttachments : undefined,
       react: async (emoji: string) => {
         await message.react(emoji).catch(() => {});
       },
@@ -261,7 +271,14 @@ export class DiscordChannel implements Channel {
     try {
       const targetChannel = await this.client.channels.fetch(target.channelId);
       if (targetChannel && 'send' in targetChannel && typeof targetChannel.send === 'function') {
-        await targetChannel.send(out.content);
+        if (out.files && out.files.length > 0) {
+          await targetChannel.send({
+            content: out.content || undefined,
+            files: out.files
+          });
+        } else {
+          await targetChannel.send(out.content);
+        }
       }
     } catch (err: any) {
       console.error(`[Discord] Failed to send message to channel ${target.channelId}:`, err.message);
