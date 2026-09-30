@@ -1,16 +1,8 @@
-import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  Client,
-  ComponentType,
-  Message,
-  TextBasedChannel
-} from 'discord.js';
 import { AppConfig } from './config.js';
 import { SessionStore } from './core/session-store.js';
 import { PerKeyQueue } from './core/queue.js';
 import { AgyRunner, getSanitizedEnvironment, parseTabSeparatedQuota } from './runners/agy.js';
+import { Channel, InboundMessage } from './channels/channel.js';
 import {
   ModelQuotaData,
   ModelQuotaResult,
@@ -56,7 +48,6 @@ export function splitDiscordMessage(text: string, maxLength = 1900): string[] {
   let codeBlockLang = '';
 
   for (const line of lines) {
-    // Check if line toggles a code block
     const codeBlockMatch = line.match(/^```(\w*)/);
     if (codeBlockMatch) {
       if (inCodeBlock) {
@@ -71,16 +62,13 @@ export function splitDiscordMessage(text: string, maxLength = 1900): string[] {
     if ((currentChunk + '\n' + line).length > maxLength) {
       if (currentChunk.length > 0) {
         if (inCodeBlock) {
-          // Close open code block before ending chunk
           chunks.push(currentChunk + '\n```');
-          // Reopen code block at beginning of next chunk
           currentChunk = '```' + codeBlockLang + '\n' + line;
         } else {
           chunks.push(currentChunk);
           currentChunk = line;
         }
       } else {
-        // Line itself exceeds maxLength, split cleanly in a loop
         let remaining = line;
         while (remaining.length > maxLength) {
           chunks.push(remaining.slice(0, maxLength));
@@ -102,7 +90,6 @@ export function splitDiscordMessage(text: string, maxLength = 1900): string[] {
 
 /**
  * Converts markdown tables to clean Discord-friendly bulleted lists.
- * Preserves tables that are enclosed within code blocks.
  */
 export function convertMarkdownTablesToBullets(text: string): string {
   const lines = text.split('\n');
@@ -115,7 +102,6 @@ export function convertMarkdownTablesToBullets(text: string): string {
     const rawLine = lines[i];
     const trimmed = rawLine.trim();
 
-    // Check code blocks
     if (trimmed.startsWith('```')) {
       inCodeBlock = !inCodeBlock;
       result.push(rawLine);
@@ -127,21 +113,18 @@ export function convertMarkdownTablesToBullets(text: string): string {
       continue;
     }
 
-    // Check if line looks like a table row: starts and ends with |
     if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.includes('|')) {
       const cells = trimmed
         .slice(1, -1)
         .split('|')
         .map(c => c.trim());
 
-      // Check if separator line (| --- | :---: | --- |)
       if (cells.every(c => /^:?-+:?$/.test(c))) {
         inTable = true;
         continue;
       }
 
       if (!inTable) {
-        // Potential header row: peek ahead to verify next line is separator
         const nextLine = lines[i + 1]?.trim();
         if (nextLine && nextLine.startsWith('|') && nextLine.includes('-')) {
           headers = cells;
@@ -153,7 +136,6 @@ export function convertMarkdownTablesToBullets(text: string): string {
         }
       }
 
-      // In table body rows
       if (headers.length > 0) {
         if (headers.length === 2) {
           result.push(`• **${cells[0]}:** ${cells[1] || ''}`);
@@ -184,7 +166,6 @@ export function redactSecrets(text: string, config?: Partial<AppConfig> & { auth
   if (!text) return '';
   let cleaned = text;
 
-  // 1. Redact configured application secrets if provided
   const botToken = config?.discordToken || process.env.DISCORD_BOT_TOKEN;
   if (botToken && botToken.length > 5) {
     cleaned = cleaned.replaceAll(botToken, '[REDACTED_BOT_TOKEN]');
@@ -194,19 +175,12 @@ export function redactSecrets(text: string, config?: Partial<AppConfig> & { auth
     cleaned = cleaned.replaceAll(mcpToken, '[REDACTED_MCP_TOKEN]');
   }
 
-  // 2. Redact Discord Bot Token format
   cleaned = cleaned.replace(/\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}\b/g, '[REDACTED_DISCORD_TOKEN]');
   cleaned = cleaned.replace(/\bmfa\.[A-Za-z0-9_-]{80,100}\b/g, '[REDACTED_MFA_TOKEN]');
-
-  // 3. Redact GitHub Personal Access Tokens
   cleaned = cleaned.replace(/\bgithub_pat_[A-Za-z0-9_]{50,}\b/g, '[REDACTED_GITHUB_PAT]');
   cleaned = cleaned.replace(/\bghp_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
   cleaned = cleaned.replace(/\bgh[ousr]_[A-Za-z0-9]{36,}\b/g, '[REDACTED_GITHUB_TOKEN]');
-
-  // 4. Redact Bearer authorization tokens
   cleaned = cleaned.replace(/Bearer\s+[A-Za-z0-9_\-\.]{16,}/gi, 'Bearer [REDACTED_TOKEN]');
-
-  // 5. Redact AI API keys & AWS access keys
   cleaned = cleaned.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b/g, '[REDACTED_AI_API_KEY]');
   cleaned = cleaned.replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_AWS_KEY]');
 
@@ -221,53 +195,31 @@ export function formatForDiscord(raw: string, config?: Partial<AppConfig> & { au
 
   let text = raw;
 
-  // 1. Redact secrets, tokens, and credentials
   text = redactSecrets(text, config);
-
-  // 2. Strip ANSI escape sequences
   text = text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-
-  // 3. Strip internal system / reasoning tags (fixing any <s> or <system> tags)
   text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
   text = text.replace(/<observation>[\s\S]*?<\/observation>/gi, '');
   text = text.replace(/<context>[\s\S]*?<\/context>/gi, '');
   text = text.replace(/<system>[\s\S]*?<\/system>/gi, '');
   text = text.replace(/<s>[\s\S]*?<\/s>/gi, '');
-
-  // 4. Prevent accidental mass mentions
   text = text.replace(/@(everyone|here)/g, '@\u200b$1');
-
-  // 5. Convert markdown tables into bulleted lists
   text = convertMarkdownTablesToBullets(text);
-
-  // 6. Demote oversized # and ## headings to ###
   text = text.replace(/^#\s+(.+)$/gm, '### $1');
   text = text.replace(/^##\s+(.+)$/gm, '### $1');
-
-  // 7. Collapse excessive blank lines
   text = text.replace(/\n{3,}/g, '\n\n');
 
   return text.trim();
 }
 
-/**
- * Detects whether a prompt expresses a deletion or destructive intent
- */
 export function isDeletionIntent(prompt: string): boolean {
   const DELETION_REGEX = /\b(delete|del|rm|remove|drop|truncate|purge|destroy|unlink|wipe|erase|clear|clean|flush|prune|empty|shred|format|discard)\b/i;
   return DELETION_REGEX.test(prompt);
 }
 
-/**
- * Checks if the user provided an explicit force or confirmation flag
- */
 export function hasExplicitConfirmationFlag(prompt: string): boolean {
   return /(--force|-f|--confirm|--yes|-y)\b/i.test(prompt);
 }
 
-/**
- * Executes a prompt against AGY (backward-compatible delegate to AgyRunner)
- */
 export async function runAgyCommand(
   prompt: string,
   conversationId?: string,
@@ -287,9 +239,6 @@ export async function runAgyCommand(
   });
 }
 
-/**
- * Renders a visual text-based progress bar (e.g. [████████░░])
- */
 export function renderProgressBar(fraction: number, length = 10): string {
   const safeFraction = typeof fraction === 'number' && !isNaN(fraction) ? fraction : 0;
   const clamped = Math.max(0, Math.min(1, safeFraction));
@@ -298,9 +247,6 @@ export function renderProgressBar(fraction: number, length = 10): string {
   return `[${'█'.repeat(filled)}${'░'.repeat(empty)}]`;
 }
 
-/**
- * Returns a color-coded status indicator emoji based on remaining quota fraction
- */
 export function getQuotaStatusEmoji(fraction: number): string {
   if (typeof fraction !== 'number' || isNaN(fraction)) return '⚪';
   if (fraction >= 0.5) return '🟢';
@@ -308,9 +254,6 @@ export function getQuotaStatusEmoji(fraction: number): string {
   return '🔴';
 }
 
-/**
- * Formats structured model quota data into Discord-first markdown
- */
 export function formatQuotaForDiscord(data: ModelQuotaData): string {
   const lines: string[] = [];
 
@@ -359,9 +302,6 @@ export function formatQuotaForDiscord(data: ModelQuotaData): string {
   return lines.join('\n').trim();
 }
 
-/**
- * Checks if a user prompt is intended to invoke the model quota command
- */
 export function isModelQuotaCommand(prompt: string): boolean {
   const clean = prompt.trim().toLowerCase();
   const triggers = [
@@ -389,9 +329,6 @@ export function isModelQuotaCommand(prompt: string): boolean {
   return triggers.some(t => clean === t || clean.startsWith(`${t} `));
 }
 
-/**
- * Fetches model quota directly from the AGY CLI non-interactively
- */
 export async function fetchModelQuota(
   agyBin = '/home/ubuntu/.local/bin/agy',
   cwd = process.cwd()
@@ -405,9 +342,9 @@ export async function fetchModelQuota(
 }
 
 /**
- * Initializes the Mainframe Bridge to allow commanding AGY from #mainframe-channel
+ * Initializes the Mainframe Bridge to listen via a Channel adapter
  */
-export function initMainframeBridge(client: Client, config: AppConfig): void {
+export function initMainframeBridge(channel: Channel, config: AppConfig): void {
   if (config.mainframeEnabled === false) {
     console.error('[Mainframe] Mainframe bridge is disabled in configuration.');
     return;
@@ -416,87 +353,45 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
   const store = getSessionStore(config.dbPath);
   const targetChannelName = (config.mainframeChannel || 'mainframe-channel').toLowerCase();
   const prefix = (config.mainframePrefix || '!agy').toLowerCase();
-  const authorizedUsers = new Set(config.mainframeAuthorizedUsers || []);
   const agyRunner = new AgyRunner({
     binPath: config.agyBinPath,
     defaultCwd: config.workDir,
     dangerouslySkipPermissions: config.skipPermissions
   });
 
-  console.error(`[Mainframe] Bridge initialized. Listening on #${targetChannelName} (Prefix: "${prefix}" or @mentions). Working dir: ${config.workDir}`);
-
-  client.on('messageCreate', async (message: Message) => {
-    // 1. Ignore bot messages
-    if (message.author.bot) return;
-
-    // 2. Validate guild boundaries
-    if (message.guildId && config.allowedGuildIds.length > 0 && !config.allowedGuildIds.includes(message.guildId)) {
-      return;
+  const sendResponse = async (channelId: string, text: string) => {
+    const chunks = splitDiscordMessage(text, 1900);
+    for (const chunk of chunks) {
+      await channel.send({ channelId }, { content: chunk });
     }
+  };
 
-    // 3. Check channel: must be #mainframe-channel or a thread under it
-    const channel = message.channel;
-    const isDirectMainframe = 'name' in channel && Boolean(channel.name && channel.name.toLowerCase() === targetChannelName);
-    const isThreadInMainframe = channel.isThread() && Boolean(channel.parent?.name && channel.parent.name.toLowerCase() === targetChannelName);
+  channel.start(async (msg: InboundMessage) => {
+    const sessionKey = msg.isDm
+      ? `dm-${msg.authorId}`
+      : msg.isThread
+      ? msg.channelId
+      : `main-${msg.channelId}`;
 
-    if (!isDirectMainframe && !isThreadInMainframe) {
-      return;
-    }
-
-    const content = message.content.trim();
-    if (!content) return;
-
-    // 4. Determine trigger condition
-    const botMention = `<@${client.user?.id}>`;
-    const botNicknameMention = `<@!${client.user?.id}>`;
-
-    let prompt = '';
-    let isTriggered = false;
-
-    if (content.toLowerCase().startsWith(prefix)) {
-      isTriggered = true;
-      prompt = content.slice(prefix.length).trim();
-    } else if (content.startsWith(botMention)) {
-      isTriggered = true;
-      prompt = content.slice(botMention.length).trim();
-    } else if (content.startsWith(botNicknameMention)) {
-      isTriggered = true;
-      prompt = content.slice(botNicknameMention.length).trim();
-    } else if (isThreadInMainframe) {
-      isTriggered = true;
-      prompt = content;
-    }
-
-    if (!isTriggered) return;
-
-    // 5. Check Authorization
-    if (!authorizedUsers.has(message.author.id)) {
-      await message.reply('⛔ **Access Denied**: You are not authorized to issue commands to the AGY Mainframe.');
-      return;
-    }
-
-    // Session Key:
-    // If inside a thread: session key is the thread ID.
-    // If in the direct mainframe channel: session key is 'main-session' (sticky persistent session).
-    const sessionKey = channel.isThread() ? channel.id : `main-${channel.id}`;
-    const targetChannel: TextBasedChannel = message.channel;
+    const prompt = msg.content.trim();
     const lowerPrompt = prompt.toLowerCase();
 
-    // 6. Handle 'stop' Command
+    // 1. Handle 'stop' Command
     if (lowerPrompt === 'stop' || lowerPrompt === 'abort' || lowerPrompt === 'cancel') {
       if (queue.isBusy(sessionKey)) {
         queue.abort(sessionKey);
-        await message.react('🛑').catch(() => {});
-        await (targetChannel as any).send('🛑 **Execution Aborted**: The active AGY process for this session has been cancelled. (Session context preserved).');
+        if (msg.react) await msg.react('🛑');
+        await sendResponse(msg.channelId, '🛑 **Execution Aborted**: The active AGY process for this session has been cancelled. (Session context preserved).');
       } else {
-        await (targetChannel as any).send('ℹ️ No active AGY execution is currently running in this session.');
+        await sendResponse(msg.channelId, 'ℹ️ No active AGY execution is currently running in this session.');
       }
       return;
     }
 
-    // 7. Handle Special Helper Commands
+    // 2. Handle 'help' Command
     if (lowerPrompt === 'help' || lowerPrompt === '--help') {
-      await (targetChannel as any).send(
+      await sendResponse(
+        msg.channelId,
         `🖥️ **Antigravity Mainframe Bridge**\n\n` +
         `**Commands:**\n` +
         `• \`${prefix} <prompt>\` — Execute a prompt in AGY (maintains continuous context)\n` +
@@ -505,62 +400,61 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         `• \`${prefix} reset\` (or \`new\`) — Start a fresh conversation\n` +
         `• \`${prefix} status\` — View active session info and bridge status\n` +
         `• \`${prefix} help\` — Show this help message\n\n` +
-        `*Tip: Conversations persist across bot restarts in SQLite. Create a thread for isolated scratchpads.*`
+        `*Tip: Conversations persist across bot restarts in SQLite. Direct Messages with registered owner IDs are fully private and persistent.*`
       );
       return;
     }
 
+    // 3. Handle 'status' Command
     if (lowerPrompt === 'status') {
       const session = store.get(sessionKey);
       const activeId = session?.conversationId || '(No active conversation yet)';
       const msgCount = session?.messageCount || 0;
-      await (targetChannel as any).send(
+      await sendResponse(
+        msg.channelId,
         `🖥️ **Mainframe Status:**\n` +
         `• **Target Channel:** #${targetChannelName}\n` +
-        `• **Session Mode:** ${channel.isThread() ? '🧵 Thread Session' : '📌 Primary Persistent Session'}\n` +
+        `• **Session Mode:** ${msg.isDm ? '💬 Private Direct Message (DM)' : msg.isThread ? '🧵 Thread Session' : '📌 Primary Persistent Session'}\n` +
         `• **Active Conversation ID:** \`${activeId}\`\n` +
         `• **Messages in Session:** ${msgCount}\n` +
         `• **Working Directory:** \`${config.workDir}\`\n` +
         `• **AGY Binary:** \`${config.agyBinPath}\`\n` +
-        `• **Operator:** <@${message.author.id}>\n` +
+        `• **Operator:** <@${msg.authorId}> (${msg.authorName})\n` +
         `• **Queue Busy:** ${queue.isBusy(sessionKey) ? '⏳ Yes' : '🟢 Idle'}`
       );
       return;
     }
 
-    if (lowerPrompt === 'new' || lowerPrompt === 'reset') {
+    // 4. Handle 'reset' / 'new' Command
+    if (lowerPrompt === 'reset' || lowerPrompt === 'new') {
       store.delete(sessionKey);
-      await (targetChannel as any).send('🔄 **Session Reset**: Your next message will begin a brand-new conversation session with AGY.');
+      await sendResponse(msg.channelId, '🔄 **Session Reset**: Your next message will begin a brand-new conversation session with AGY.');
       return;
     }
 
+    // 5. Handle Model Quota Command
     if (isModelQuotaCommand(prompt)) {
       try {
-        await message.react('📊').catch(() => {});
-        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
-          await (targetChannel as any).sendTyping().catch(() => {});
-        }
+        if (msg.react) await msg.react('📊');
+        if (msg.sendTyping) await msg.sendTyping();
 
         const isRaw = /(--json|-j|--raw|-r)\b/i.test(prompt);
         const quotaResult = await agyRunner.fetchQuota(config.workDir);
 
         if (!quotaResult.success) {
-          await message.reactions.removeAll().catch(() => {});
-          await message.react('❌').catch(() => {});
+          if (msg.clearReactions) await msg.clearReactions();
+          if (msg.react) await msg.react('❌');
           const safeErr = redactSecrets(quotaResult.error || 'Failed to query model quota', config);
-          await (targetChannel as any).send(`❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);
+          await sendResponse(msg.channelId, `❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);
           return;
         }
 
-        await message.reactions.removeAll().catch(() => {});
-        await message.react('✅').catch(() => {});
+        if (msg.clearReactions) await msg.clearReactions();
+        if (msg.react) await msg.react('✅');
 
         if (isRaw) {
           const payload = quotaResult.data ? JSON.stringify(quotaResult.data, null, 2) : (quotaResult.rawText || '{}');
-          const chunks = splitDiscordMessage(`### 📊 Model Quota (Raw Data)\n\`\`\`json\n${payload}\n\`\`\``);
-          for (const chunk of chunks) {
-            await (targetChannel as any).send(chunk);
-          }
+          await sendResponse(msg.channelId, `### 📊 Model Quota (Raw Data)\n\`\`\`json\n${payload}\n\`\`\``);
           return;
         }
 
@@ -573,95 +467,43 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
           messageToSend = '• **Model Quota:** No quota information available.';
         }
 
-        const chunks = splitDiscordMessage(messageToSend);
-        for (const chunk of chunks) {
-          await (targetChannel as any).send(chunk);
-        }
+        await sendResponse(msg.channelId, messageToSend);
       } catch (quotaErr: any) {
-        await message.reactions.removeAll().catch(() => {});
-        await message.react('❌').catch(() => {});
+        if (msg.clearReactions) await msg.clearReactions();
+        if (msg.react) await msg.react('❌');
         const safeErr = redactSecrets(quotaErr.message || String(quotaErr), config);
-        await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
+        await sendResponse(msg.channelId, `❌ **Unexpected Error**: ${safeErr}`);
       }
       return;
     }
 
     if (!prompt) {
-      await (targetChannel as any).send(`Please provide a prompt after \`${prefix}\`. Example: \`${prefix} what is the current git status?\``);
+      await sendResponse(msg.channelId, `Please provide a prompt after \`${prefix}\`. Example: \`${prefix} what is the current git status?\``);
       return;
     }
 
-    // 8. Check Deletion / Destructive Intent & Confirmation
+    // 6. Check Deletion / Destructive Intent
     if (isDeletionIntent(prompt) && !hasExplicitConfirmationFlag(prompt)) {
-      const confirmButton = new ButtonBuilder()
-        .setCustomId('confirm_deletion')
-        .setLabel('Confirm Deletion')
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji('🗑️');
-
-      const cancelButton = new ButtonBuilder()
-        .setCustomId('cancel_deletion')
-        .setLabel('Cancel')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('✖️');
-
-      const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(confirmButton, cancelButton);
-      const promptPreview = prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt;
-
-      const confirmMsg = await (targetChannel as any).send({
-        content:
-          `⚠️ **Deletion Confirmation Required**\n` +
-          `Your prompt contains a deletion or destructive operation request:\n` +
-          `> \`${promptPreview}\`\n\n` +
-          `Click **Confirm Deletion** to proceed or **Cancel** to abort. *(Auto-cancels in 60s)*`,
-        components: [actionRow]
-      });
-
-      try {
-        const interaction = await confirmMsg.awaitMessageComponent({
-          componentType: ComponentType.Button,
-          filter: (i: any) => i.user.id === message.author.id,
-          time: 60000
-        });
-
-        if (interaction.customId === 'cancel_deletion') {
-          await interaction.update({
-            content: `❌ **Operation Cancelled**: Deletion request was cancelled by <@${message.author.id}>.`,
-            components: []
-          });
+      if (msg.confirmAction) {
+        const confirmed = await msg.confirmAction(prompt);
+        if (!confirmed) {
           return;
         }
-
-        await interaction.update({
-          content: `🗑️ **Deletion Confirmed** by <@${message.author.id}>. Dispatching to AGY...`,
-          components: []
-        });
-      } catch {
-        await confirmMsg.edit({
-          content: `⏳ **Operation Cancelled**: Deletion confirmation timed out after 60 seconds.`,
-          components: []
-        }).catch(() => {});
-        return;
       }
     }
 
-    // 9. Execute AGY Prompt via FIFO Queue for this session
-    await message.react('⚙️').catch(() => {});
+    // 7. Enqueue AGY execution for this session
+    if (msg.react) await msg.react('⚙️');
 
     await queue.enqueue(sessionKey, async (signal: AbortSignal) => {
       const currentConvId = store.getConversationId(sessionKey) || undefined;
 
-      // Periodic typing indicator while running
       const typingInterval = setInterval(() => {
-        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
-          (targetChannel as any).sendTyping().catch(() => {});
-        }
+        if (msg.sendTyping) msg.sendTyping().catch(() => {});
       }, 7000);
 
       try {
-        if ('sendTyping' in targetChannel && typeof (targetChannel as any).sendTyping === 'function') {
-          await (targetChannel as any).sendTyping().catch(() => {});
-        }
+        if (msg.sendTyping) await msg.sendTyping().catch(() => {});
 
         const sessionPrompt = currentConvId
           ? prompt
@@ -677,85 +519,40 @@ export function initMainframeBridge(client: Client, config: AppConfig): void {
         clearInterval(typingInterval);
 
         if (result.aborted) {
-          await message.reactions.removeAll().catch(() => {});
-          await message.react('🛑').catch(() => {});
+          if (msg.clearReactions) await msg.clearReactions().catch(() => {});
+          if (msg.react) await msg.react('🛑').catch(() => {});
           return;
         }
 
         if (result.error) {
-          await message.reactions.removeAll().catch(() => {});
-          await message.react('❌').catch(() => {});
+          if (msg.clearReactions) await msg.clearReactions().catch(() => {});
+          if (msg.react) await msg.react('❌').catch(() => {});
           const safeError = redactSecrets(result.error, config);
-          await (targetChannel as any).send(`❌ **AGY Execution Error**:\n\`\`\`text\n${safeError}\n\`\`\``);
+          await sendResponse(msg.channelId, `❌ **AGY Execution Error**:\n\`\`\`text\n${safeError}\n\`\`\``);
           return;
         }
 
-        // Save conversation ID to SQLite
         if (result.conversationId) {
           store.set(sessionKey, result.conversationId, {
-            channelId: channel.id,
-            isThread: channel.isThread(),
-            authorId: message.author.id
+            channelId: msg.channelId,
+            isDm: msg.isDm,
+            isThread: msg.isThread,
+            authorId: msg.authorId
           });
         }
 
-        await message.reactions.removeAll().catch(() => {});
-        await message.react('✅').catch(() => {});
+        if (msg.clearReactions) await msg.clearReactions().catch(() => {});
+        if (msg.react) await msg.react('✅').catch(() => {});
 
         const formatted = formatForDiscord(result.response || '(Done with no output)', config);
-        const chunks = splitDiscordMessage(formatted, 1900);
-
-        for (const chunk of chunks) {
-          await (targetChannel as any).send(chunk);
-        }
+        await sendResponse(msg.channelId, formatted);
       } catch (err: any) {
         clearInterval(typingInterval);
-        await message.reactions.removeAll().catch(() => {});
-        await message.react('❌').catch(() => {});
+        if (msg.clearReactions) await msg.clearReactions().catch(() => {});
+        if (msg.react) await msg.react('❌').catch(() => {});
         const safeErr = redactSecrets(err.message || String(err), config);
-        await (targetChannel as any).send(`❌ **Unexpected Error**: ${safeErr}`).catch(() => {});
+        await sendResponse(msg.channelId, `❌ **Unexpected Error**: ${safeErr}`);
       }
     });
-  });
-
-  // Handle Slash Commands
-  client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-
-    if (interaction.commandName === 'quota' || interaction.commandName === 'model-quota') {
-      if (interaction.guildId && config.allowedGuildIds.length > 0 && !config.allowedGuildIds.includes(interaction.guildId)) {
-        await interaction.reply({ content: '⛔ This server is not authorized for Hyposea Mainframe commands.', ephemeral: true });
-        return;
-      }
-
-      if (!authorizedUsers.has(interaction.user.id)) {
-        await interaction.reply({ content: '⛔ **Access Denied**: You are not authorized to query the AGY Mainframe.', ephemeral: true });
-        return;
-      }
-
-      await interaction.deferReply();
-      try {
-        const quotaResult = await agyRunner.fetchQuota(config.workDir);
-        if (!quotaResult.success) {
-          const safeErr = redactSecrets(quotaResult.error || 'Failed to query quota', config);
-          await interaction.editReply(`❌ **Failed to retrieve model quota**:\n\`\`\`text\n${safeErr}\n\`\`\``);
-          return;
-        }
-
-        let messageToSend = '';
-        if (quotaResult.data && quotaResult.data.groups && quotaResult.data.groups.length > 0) {
-          messageToSend = formatQuotaForDiscord(quotaResult.data);
-        } else if (quotaResult.rawText) {
-          messageToSend = formatForDiscord(quotaResult.rawText, config);
-        } else {
-          messageToSend = '• **Model Quota:** No quota information available.';
-        }
-
-        await interaction.editReply(messageToSend);
-      } catch (err: any) {
-        const safeErr = redactSecrets(err.message || String(err), config);
-        await interaction.editReply(`❌ **Error fetching quota**: ${safeErr}`);
-      }
-    }
   });
 }
