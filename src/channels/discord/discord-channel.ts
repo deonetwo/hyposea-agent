@@ -78,7 +78,7 @@ export class DiscordChannel implements Channel {
     if (message.author.bot) return;
 
     const rawContent = message.content.trim();
-    if (!rawContent) return;
+    if (!rawContent && message.attachments.size === 0) return;
 
     const isDm = message.channel.isDMBased() || !message.guildId;
     const authorId = message.author.id;
@@ -104,6 +104,9 @@ export class DiscordChannel implements Channel {
       let prompt = rawContent;
       if (prompt.toLowerCase().startsWith(prefix)) {
         prompt = prompt.slice(prefix.length).trim();
+      }
+      if (!prompt && rawAttachments.length > 0) {
+        prompt = 'Please inspect the attached files.';
       }
 
       const inbound: InboundMessage = {
@@ -169,6 +172,11 @@ export class DiscordChannel implements Channel {
     } else if (isThreadInMainframe) {
       isTriggered = true;
       prompt = rawContent;
+    }
+
+    if (!prompt && rawAttachments.length > 0 && (isThreadInMainframe || isTriggered)) {
+      isTriggered = true;
+      prompt = 'Please inspect the attached files.';
     }
 
     if (!isTriggered) return;
